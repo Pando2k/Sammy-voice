@@ -1,33 +1,30 @@
 import express from "express";
-import twilio from "twilio";
 
 const app = express();
-const { twiml } = twilio;
 
-// Twilio sends form-encoded data, so we enable URL encoding
+// Twilio may send urlencoded form data; we don't need JSON here
 app.use(express.urlencoded({ extended: false }));
 
-// --- Voice endpoint for Twilio ---
+// ---- Voice endpoint (handles both POST and GET) ----
+const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="Polly.Nicole-Neural">Hi, it's Sammy. How can I help you today?</Say>
+</Response>`;
+
 app.post("/voice", (req, res) => {
-  const response = new twiml.VoiceResponse();
-
-  response.say(
-    {
-      voice: "Polly.Nicole-Neural" // Australian female neural voice
-    },
-    "Hi, it's Sammy. How can I help you today?"
-  );
-
-  res.type("text/xml");
-  res.send(response.toString());
+  res.type("text/xml").send(twiml);
 });
 
-// Default homepage (useful for testing)
-app.get("/", (req, res) => {
+app.get("/voice", (req, res) => {
+  // In case Twilio is configured as GET by mistake
+  res.type("text/xml").send(twiml);
+});
+
+// Default homepage (warming check)
+app.get("/", (_req, res) => {
   res.send("Sammy Voice Server is running!");
 });
 
-// Render uses process.env.PORT
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);

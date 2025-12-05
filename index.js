@@ -7,10 +7,9 @@ const { twiml: { VoiceResponse } } = twilio;
 // Parse application/x-www-form-urlencoded like Twilio sends
 app.use(express.urlencoded({ extended: false }));
 
-// ---- Voice webhook: accept both POST and GET just in case ----
+// ---- Voice webhook: accept both POST and GET ----
 const handleVoice = (req, res) => {
   try {
-    // Log a few useful fields (shows up in Render logs)
     console.log("Voice webhook hit:", {
       method: req.method,
       from: req.body.From,
@@ -19,8 +18,9 @@ const handleVoice = (req, res) => {
     });
 
     const response = new VoiceResponse();
+
     response.say(
-      { voice: "Polly.Nicole-Neural" },  // AU female neural voice
+      { voice: "Polly.Nicole-Neural" },
       "Hi, it's Sammy. How can I help you today?"
     );
 
@@ -32,15 +32,15 @@ const handleVoice = (req, res) => {
   }
 };
 
-// Accept POST (normal Twilio) and GET (fallback if misconfigured)
+// Accept POST and GET
 app.post("/voice", handleVoice);
 app.get("/voice", handleVoice);
 
-// Simple home page (helps wake free Render dyno)
+// Homepage
 app.get("/", (_req, res) => {
   res.send("Sammy Voice Server is running!");
 });
 
-// Use Render port
+// Render port
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Server running on port ${port}`));

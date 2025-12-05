@@ -1,18 +1,18 @@
 import express from "express";
 import twilio from "twilio";
 
-// ====== CONFIG ======
-const ELEVEN_API_KEY = process.env.ELEVENLABS_API_KEY || "";   // <-- set in Render
-const ELEVEN_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || ""; // Sammy voice id
-// ====================
+const ELEVEN_API_KEY = process.env.ELEVENLABS_API_KEY || "";
+const ELEVEN_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "";
 
 const app = express();
 const { VoiceResponse } = twilio.twiml;
 
-// Twilio posts x-www-form-urlencoded
 app.use(express.urlencoded({ extended: false }));
 
-// Serve synthesized audio back to Twilio
+// health
+app.get("/", (_req, res) => res.send("Sammy Voice Agent is running!"));
+
+// serve synthesized audio
 app.get("/audio/:file", (req, res) => {
   res.setHeader("Cache-Control", "public, max-age=300");
   res.sendFile(`/tmp/${req.params.file}`, { root: "/" }, (err) => {
@@ -20,91 +20,87 @@ app.get("/audio/:file", (req, res) => {
   });
 });
 
-// Health
-app.get("/", (_req, res) => res.send("Sammy Voice Agent is running!"));
-
-// ---------- CALL ENTRY: prompt & keep line open ----------
+// ---------- entry: gather speech ----------
 app.all("/voice", (req, res) => {
   const vr = new VoiceResponse();
+
+  // ALWAYS call our action, even if Twilio hears nothing
   const g = vr.gather({
     input: "speech",
-    speechTimeout: "auto",
     language: "en-AU",
+    speechTimeout: "auto",
+    timeout: 6,
+    actionOnEmptyResult: true,
     action: "/handle_speech",
     method: "POST"
   });
 
-  // Fallback TTS so there’s *always* a voice even if ElevenLabs fails later
+  // Initial prompt (Twilio TTS just to start the convo)
   g.say({ voice: "alice", language: "en-AU" },
         "Hi, it's Sammy. How can I help you today?");
 
-  // If no speech captured, re-prompt
-  vr.say({ voice: "alice", language: "en-AU" }, "Sorry, I didn't catch that.");
+  // If gather didn’t fire for any reason, reprompt by redirecting back here
   vr.redirect("/voice");
 
   res.type("text/xml").status(200).send(vr.toString());
 });
 
-// ---------- HANDLE USER SPEECH ----------
+// ---------- handle user speech, synth with ElevenLabs, loop ----------
 app.post("/handle_speech", async (req, res) => {
   const vr = new VoiceResponse();
   try {
     const b = req.body || {};
-    const text = (b.SpeechResult || "").trim();
-    const conf = b.Confidence;
+    console.log("HANDLE_SPEECH body:", JSON.stringify(b));
 
-    console.log("User said:", text, "conf:", conf);
+    const user = (b.SpeechResult || "").trim();
+    const reply = buildReply(user);
 
-    // 1) Make a friendly reply (simple small-talk brain)
-    const reply = buildReply(text);
-
-    // 2) Synthesize with ElevenLabs "Sammy"
     const fileName = `sammy_${Date.now()}.mp3`;
     const ok = await synthElevenLabs(reply, `/tmp/${fileName}`);
 
     if (ok) {
       const host = req.headers["x-forwarded-host"] || req.headers.host;
-      const baseUrl = `https://${host}`;
-      vr.play(`${baseUrl}/audio/${fileName}`);
+      const base = `https://${host}`;
+      vr.play(`${base}/audio/${fileName}`);
     } else {
-      // Fallback to Twilio TTS if synthesis fails
       vr.say({ voice: "alice", language: "en-AU" }, reply);
     }
 
-    // Keep convo going
+    // keep the conversation going
     vr.redirect("/voice");
     res.type("text/xml").status(200).send(vr.toString());
-  } catch (err) {
-    console.error("handle_speech error:", err);
-    vr.say({ voice: "alice", language: "en-AU" }, "Sorry, something went wrong.");
+  } catch (e) {
+    console.error("handle_speech error:", e);
+    vr.say({ voice: "alice", language: "en-AU" },
+           "Sorry, something went wrong. Let's try again.");
     vr.redirect("/voice");
     res.type("text/xml").status(200).send(vr.toString());
   }
 });
 
-// ---------- Small-talk brain (replace with OpenAI later) ----------
+// ---------- tiny rule-based brain ----------
 function buildReply(user) {
-  if (!user) return "Hey there. What would you like to do?";
+  if (!user) return "I didn’t catch that. Could you say that again?";
   const u = user.toLowerCase();
 
-  if (/(hi|hello|hey)/.test(u)) return "Hi! I’m Sammy. What can I help with today?";
+  if (/(hi|hello|hey)/.test(u)) return "Hi! I’m Sammy. What can I do for you?";
   if (/name/.test(u)) return "I’m Sammy, your Aussie voice agent.";
-  if (/(time|date)/.test(u)) return "I can help route your request or take a message.";
-  if (/(help|support|problem)/.test(u)) return "Sure thing. Tell me what’s going on and I’ll sort it.";
-  if (/(thank|thanks)/.test(u)) return "No worries! Anything else I can do for you?";
+  if (/(help|support|problem|issue)/.test(u))
+    return "No worries. Tell me what’s happening and I’ll help.";
+  if (/(thank|thanks)/.test(u))
+    return "You’re welcome! Anything else I can do?";
 
-  return `Got it. You said: ${user}. Do you want me to take a message or help with something else?`;
+  return `You said: ${user}. Do you want me to take a message or help with something else?`;
 }
 
-// ---------- ElevenLabs TTS helper ----------
+// ---------- ElevenLabs TTS ----------
 async function synthElevenLabs(text, outPath) {
   try {
     if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) {
-      console.warn("Missing ElevenLabs env vars; skipping TTS.");
+      console.warn("Missing ELEVENLABS_API_KEY or ELEVENLABS_VOICE_ID");
       return false;
     }
     const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}?optimize_streaming_latency=2`;
-
     const r = await fetch(url, {
       method: "POST",
       headers: {
@@ -115,29 +111,29 @@ async function synthElevenLabs(text, outPath) {
       body: JSON.stringify({
         text,
         model_id: "eleven_monolingual_v1",
-        voice_settings: { stability: 0.4, similarity_boost: 0.85, style: 0.2, use_speaker_boost: true }
+        voice_settings: {
+          stability: 0.4,
+          similarity_boost: 0.85,
+          style: 0.2,
+          use_speaker_boost: true
+        }
       })
     });
-
     if (!r.ok) {
-      console.error("ElevenLabs error:", r.status, await safeText(r));
+      console.error("ElevenLabs HTTP", r.status, await safeText(r));
       return false;
     }
-
-    const arrayBuf = await r.arrayBuffer();
-    await import("node:fs/promises")
-      .then(fs => fs.writeFile(outPath, Buffer.from(arrayBuf)));
+    const buf = Buffer.from(await r.arrayBuffer());
+    const fs = await import("node:fs/promises");
+    await fs.writeFile(outPath, buf);
     return true;
   } catch (e) {
     console.error("synthElevenLabs exception:", e);
     return false;
   }
 }
+async function safeText(resp) { try { return await resp.text(); } catch { return "<no body>"; } }
 
-async function safeText(resp) {
-  try { return await resp.text(); } catch { return "<no body>"; }
-}
-
-// ---------- Render port ----------
+// ---------- port ----------
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Server running on port ${port}`));

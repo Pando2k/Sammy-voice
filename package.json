@@ -1,9 +1,9 @@
 {
-  "name": "sammy-voice-v3",
+  "name": "sammy-v4-ultra-interactive",
   "version": "1.0.0",
-  "type": "module",
-  "description": "Sammy realtime-ish voice agent (Twilio + OpenAI + ElevenLabs) on Render",
+  "description": "Sammy v4 Ultra-Interactive (Playful + Cheeky) — Twilio + OpenAI + ElevenLabs",
   "main": "server.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node server.js",
     "render-build": "echo Skipping build"

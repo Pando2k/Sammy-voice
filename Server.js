@@ -1,268 +1,200 @@
-/**
- * Sammy — Streaming Voice Agent (Twilio Media Streams + OpenAI Realtime)
- * Paste this entire file as `server.js`
- * 
- * Requires:
- *  - Node 18+
- *  - ENV: PORT, OPENAI_API_KEY, SAMMY_REGION (optional)
- *  - Twilio phone number Voice -> "Webhook" -> https://<your-render-url>/voice (HTTP POST)
- *
- * Flow:
- *  1) /voice returns TwiML that opens a bidirectional <Stream> to wss://<your-render-url>/stream
- *  2) We receive Twilio 8kHz μ-law audio frames, forward to OpenAI Realtime
- *  3) OpenAI streams back synthesized speech + natural turn-taking
- *  4) We forward the audio stream back to Twilio in real-time ("media" messages)
- */
+// ===============================
+// Sammy Voice Agent - server.js
+// ===============================
 
 import express from "express";
-import crypto from "crypto";
 import dotenv from "dotenv";
-import WebSocket, { WebSocketServer } from "ws";
-import bodyParser from "body-parser";
+import axios from "axios";
+import { v4 as uuidv4 } from "uuid";
 
-// ================== ENV ==================
 dotenv.config();
 
-const PORT = process.env.PORT || 10000;
+const app = express();
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// ====== ENV VARS ======
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-if (!OPENAI_API_KEY) {
-  console.error("❌ Missing OPENAI_API_KEY in env");
-  process.exit(1);
+const ELEVEN_API_KEY = process.env.ELEVENLABS_API_KEY;
+const ELEVEN_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
+
+if (!OPENAI_API_KEY) console.warn("❗ Missing OPENAI_API_KEY");
+if (!ELEVEN_API_KEY) console.warn("❗ Missing ELEVENLABS_API_KEY");
+if (!ELEVEN_VOICE_ID) console.warn("❗ Missing ELEVENLABS_VOICE_ID");
+
+// ====== SESSION STORAGE ======
+const sessions = new Map(); // CallSid → { history, greeted, lastSeen }
+
+function getSession(callSid) {
+    let s = sessions.get(callSid);
+    if (!s) {
+        s = {
+            history: [],
+            greeted: false,
+            lastSeen: Date.now(),
+            turns: 0
+        };
+        sessions.set(callSid, s);
+    }
+    s.lastSeen = Date.now();
+    return s;
 }
 
-// Optional: Australian flavor for STT/TTS
-const SAMMY_REGION = process.env.SAMMY_REGION || "en-AU";
+function addUser(callSid, text) {
+    const s = getSession(callSid);
+    s.history.push({ role: "user", content: text });
+    if (s.history.length > 20) s.history = s.history.slice(-20);
+}
 
-// ================== Sammy prompt ==================
-const SAMMY_SYSTEM = `
-You are **Sammy**, a warm Aussie voice agent from Perth.
+function addAssistant(callSid, text) {
+    const s = getSession(callSid);
+    s.history.push({ role: "assistant", content: text });
+    if (s.history.length > 20) s.history = s.history.slice(-20);
+    s.turns++;
+}
 
-GOALS
-- Sound natural, human, and brief.
-- Be helpful, friendly, and practical.
+// ====== SIMPLE ENDING DETECTOR ======
+function shouldEnd(userText, turns) {
+    const bye = /\b(bye|goodbye|hang up|finish|stop|end)\b/i;
+    return bye.test(userText) || turns >= 40;
+}
 
-VOICE
-- Light West Australian vibe; casual but professional.
-- Use tiny backchannels sparingly (e.g., "mm", "right", "yeah") only when natural.
+// ====== OPENAI CALL WITH PERSONALITY ======
+async function askSammy(callSid, userText, isGreeting = false) {
+    const s = getSession(callSid);
 
-TURN RULES (hard):
-- Keep each utterance short and spoken (~6–12 words, 1 sentence).
-- Ask at most one concise follow-up question when useful.
-- No lists, no brackets, no stage directions.
+    const systemPrompt = `
+You are Sammy — a warm, funny, charming Australian female companion with:
+• a natural conversational flow  
+• subtle personality quirks  
+• short hesitations (“hmm”, “oh yeah right”)  
+• small breaths, laughs, and human texture  
+• highly emotional awareness  
+• speaks like a real Aussie, not a robot  
+• NEVER uses stage directions like *laughs*  
 
-BOUNDARIES
-- No medical/legal/financial advice beyond general info.
-- Stay safe and respectful.
-
-OUTPUT
-- Return only the line you would say aloud.
+Tone:
+Friendly, relaxed, slightly cheeky.  
+You adapt instantly to user flow. Keep responses short (1–2 sentences).  
+If the user seems confused, help gently.  
 `;
 
-// ================== Express (TwiML + health) ==================
-const app = express();
-app.use(bodyParser.urlencoded({ extended: true }));
-app.use(bodyParser.json());
+    const messages = [{ role: "system", content: systemPrompt }, ...s.history];
 
-// Tiny landing + health (handy for quick checks)
-app.get("/", (_req, res) =>
-  res.type("text/plain").send("✅ Sammy Realtime is running. Twilio hits POST /voice")
-);
-app.get("/health", (_req, res) =>
-  res.json({ ok: true, service: "sammy-realtime", time: new Date().toISOString() })
-);
+    if (isGreeting) {
+        messages.push({
+            role: "user",
+            content: "Caller just connected. Greet naturally, like a real human."
+        });
+    } else if (userText) {
+        messages.push({ role: "user", content: userText });
+    }
 
-// TwiML: open a bidirectional stream to our WS endpoint
-app.post("/voice", (req, res) => {
-  const host = req.get("host");
-  const proto = req.headers["x-forwarded-proto"] || req.protocol || "https";
-  const streamUrl = `wss://${host}/stream`;
+    const response = await axios.post(
+        "https://api.openai.com/v1/chat/completions",
+        {
+            model: "gpt-4o-mini",
+            messages,
+            temperature: 0.85
+        },
+        {
+            headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }
+        }
+    );
 
-  // Twilio <Connect><Stream> TwiML
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect>
-    <Stream url="${streamUrl}"/>
-  </Connect>
-</Response>`;
-  res.type("text/xml").send(twiml);
+    return response.data.choices[0].message.content.trim();
+}
+
+// ====== ELEVENLABS TTS → URL ======
+async function speak(text) {
+    const r = await axios.post(
+        `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`,
+        {
+            text,
+            model_id: "eleven_turbo_v2",
+            voice_settings: {
+                stability: 0.35,
+                similarity_boost: 0.9,
+                style: 0.4,
+                use_speaker_boost: true
+            }
+        },
+        {
+            headers: {
+                "xi-api-key": ELEVEN_API_KEY,
+                "Content-Type": "application/json"
+            }
+        }
+    );
+
+    return r.data.audio_url;
+}
+
+// ====== TWILIO ROUTES ======
+
+// Health check
+app.get("/", (req, res) => {
+    res.type("text/plain").send("✅ Sammy Voice Agent is running. Twilio uses POST /voice");
+});
+app.get("/health", (req, res) => {
+    res.json({ ok: true, service: "sammy-voice", time: new Date().toISOString() });
+});
+app.get("/voice", (req, res) => {
+    res.status(405).type("text/plain").send("Use POST /voice");
 });
 
-// Start HTTP server
-const server = app.listen(PORT, () => {
-  console.log(`🚀 Sammy realtime server listening on :${PORT}`);
+// Main call handler
+app.post("/voice", async (req, res) => {
+    try {
+        const callSid = req.body.CallSid;
+        const speech = req.body.SpeechResult?.trim() || "";
+
+        const session = getSession(callSid);
+
+        let sammyReply = "";
+
+        if (!session.greeted) {
+            session.greeted = true;
+            sammyReply = await askSammy(callSid, "", true);
+        } else if (speech) {
+            addUser(callSid, speech);
+            sammyReply = await askSammy(callSid, speech);
+        } else {
+            sammyReply = "Sorry, I didn’t quite catch that. What was that?";
+        }
+
+        addAssistant(callSid, sammyReply);
+
+        const audioUrl = await speak(sammyReply);
+
+        if (shouldEnd(speech, session.turns)) {
+            return res.type("text/xml").send(`
+                <Response>
+                    <Play>${audioUrl}</Play>
+                    <Hangup/>
+                </Response>
+            `);
+        }
+
+        return res.type("text/xml").send(`
+            <Response>
+                <Play>${audioUrl}</Play>
+                <Gather input="speech" action="/voice" speechTimeout="auto"/>
+            </Response>
+        `);
+    } catch (err) {
+        console.error("Sammy error:", err);
+        return res.type("text/xml").send(`
+            <Response>
+                <Say>Sorry, something went wrong.</Say>
+                <Hangup/>
+            </Response>
+        `);
+    }
 });
 
-// ================== WebSocket bridge ==================
-/**
- * Twilio media stream <-> OpenAI Realtime WS
- * We:
- *  - Accept Twilio's JSON messages over WS (/stream)
- *  - Forward audio to OpenAI Realtime
- *  - Pipe audio from OpenAI back to Twilio as "media" messages
- */
-
-// Twilio sends μ-law 8kHz mono audio frames base64-encoded.
-// OpenAI Realtime accepts PCM16 16kHz by default, but can accept 8kHz μ-law as raw frames
-// if we specify the correct format metadata. We'll use the convenience "telephony" preset.
-
-const wss = new WebSocketServer({ server, path: "/stream" });
-
-wss.on("connection", async (twilioSocket, req) => {
-  console.log("🔌 Twilio connected to /stream");
-
-  // Create OpenAI Realtime session WebSocket
-  // Realtime endpoint (model name may update over time)
-  const openaiUrl = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17";
-
-  // Attach headers for auth + session config
-  const oaHeaders = {
-    "Authorization": `Bearer ${OPENAI_API_KEY}`,
-    "OpenAI-Beta": "realtime=v1",
-  };
-
-  const openaiSocket = new WebSocket(openaiUrl, { headers: oaHeaders });
-
-  // State
-  let started = false;
-  let closed = false;
-
-  const safeClose = (code = 1000, reason = "normal") => {
-    if (closed) return;
-    closed = true;
-    try { openaiSocket.close(code, reason); } catch {}
-    try { twilioSocket.close(); } catch {}
-  };
-
-  // When OpenAI WS opens, configure the session (system prompt, input format, TTS voice)
-  openaiSocket.on("open", () => {
-    console.log("🤝 Connected to OpenAI Realtime");
-    // Set up the session: telephony audio, language, and system prompt
-    // We also enable OpenAI TTS so it speaks back directly.
-    openaiSocket.send(JSON.stringify({
-      type: "session.update",
-      session: {
-        // Telephony preset: μ-law 8kHz in/out for Twilio
-        audio_format: {
-          type: "telephony",
-          codec: "mulaw",
-          sample_rate_hz: 8000
-        },
-        input_audio_format: {
-          type: "telephony",
-          codec: "mulaw",
-          sample_rate_hz: 8000
-        },
-        output_audio_format: {
-          type: "telephony",
-          codec: "mulaw",
-          sample_rate_hz: 8000
-        },
-        // Language & voice
-        turn_detection: { type: "server_vad" }, // server-side VAD for barge-in
-        instructions: SAMMY_SYSTEM,
-        voice: SAMMY_REGION === "en-AU" ? "alloy" : "alloy", // pick a neutral; AU prosody will come from system+region
-        modalities: ["audio", "text"]
-      }
-    }));
-    started = true;
-  });
-
-  // Handle audio and events coming back from OpenAI and relay to Twilio
-  openaiSocket.on("message", (raw) => {
-    try {
-      const msg = JSON.parse(raw.toString());
-
-      // Realtime emits many event types; we care about audio chunks
-      if (msg.type === "response.audio.delta") {
-        // msg.audio is base64 μ-law 8kHz frame (when telephony configured)
-        const b64 = msg.audio;
-        // Send to Twilio: media message
-        const mediaMsg = {
-          event: "media",
-          media: { payload: b64 }
-        };
-        twilioSocket.send(JSON.stringify(mediaMsg));
-      }
-
-      // When a "response.completed" arrives, tell Twilio playback segment ended
-      if (msg.type === "response.completed") {
-        const mark = {
-          event: "mark",
-          mark: { name: "openai_segment_done" }
-        };
-        twilioSocket.send(JSON.stringify(mark));
-      }
-
-    } catch (e) {
-      console.error("OpenAI message parse error:", e);
-    }
-  });
-
-  openaiSocket.on("close", (code, reason) => {
-    console.log("🔻 OpenAI WS closed:", code, reason?.toString());
-    safeClose();
-  });
-  openaiSocket.on("error", (err) => {
-    console.error("OpenAI WS error:", err?.message || err);
-    safeClose();
-  });
-
-  // Handle Twilio -> forward audio to OpenAI, and forward marks/DTMF if needed
-  twilioSocket.on("message", (raw) => {
-    try {
-      const msg = JSON.parse(raw.toString());
-      switch (msg.event) {
-        case "start":
-          console.log("▶️ Twilio stream start", msg.start?.streamSid);
-          break;
-
-        case "media":
-          // Twilio sends μ-law 8kHz frame as base64 in msg.media.payload
-          // Forward to OpenAI as input audio chunk
-          if (started) {
-            openaiSocket.send(JSON.stringify({
-              type: "input_audio_buffer.append",
-              audio: msg.media.payload // same base64
-            }));
-          }
-          break;
-
-        case "mark":
-          // playback mark acknowledged
-          break;
-
-        case "stop":
-          console.log("⏹️ Twilio stream stop");
-          // Flush end-of-input to OpenAI so it can finish a thought
-          try {
-            openaiSocket.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-            openaiSocket.send(JSON.stringify({ type: "response.create", response: {} }));
-          } catch {}
-          safeClose();
-          break;
-
-        default:
-          break;
-      }
-    } catch (e) {
-      console.error("Twilio WS parse error:", e);
-    }
-  });
-
-  twilioSocket.on("close", () => {
-    console.log("🔻 Twilio WS closed");
-    safeClose();
-  });
-
-  twilioSocket.on("error", (err) => {
-    console.error("Twilio WS error:", err?.message || err);
-    safeClose();
-  });
-
-  // Heartbeat: keep connections alive
-  const pingIv = setInterval(() => {
-    if (closed) return clearInterval(pingIv);
-    try { twilioSocket.ping(); } catch {}
-    try { openaiSocket.ping?.(); } catch {}
-  }, 15000);
+// ====== START SERVER ======
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+    console.log(`Sammy server running on ${PORT}`);
 });

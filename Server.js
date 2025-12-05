@@ -1,20 +1,18 @@
-// server.js — Sammy v3 (smoother turn-taking, en-AU STT, anti-loop)
-// Twilio <Gather speech> -> OpenAI reply -> ElevenLabs TTS -> <Play> -> next <Gather>
+// server.js — Sammy v4 (humanized replies + en-AU STT + robust turn-taking)
 
 const express = require("express");
 const dotenv = require("dotenv");
 const axios = require("axios");
-const qs = require("querystring");
 
 dotenv.config();
 
-// ---- ENV
 const PORT = process.env.PORT || 10000;
-const OPENAI_API_KEY     = process.env.OPENAI_API_KEY || "";
-const ELEVEN_API_KEY     = process.env.ELEVENLABS_API_KEY || "";
-const ELEVEN_VOICE_ID    = process.env.ELEVENLABS_VOICE_ID || "";
-const SAMMY_MODE         = (process.env.SAMMY_MODE || "friendly").toLowerCase(); // friendly|flirty|pro
-const STT_HINTS          = process.env.SAMMY_HINTS || ""; // optional comma-separated phrases for Twilio STT
+const OPENAI_API_KEY  = process.env.OPENAI_API_KEY || "";
+const ELEVEN_API_KEY  = process.env.ELEVENLABS_API_KEY || "";
+const ELEVEN_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "";
+const SAMMY_MODE      = (process.env.SAMMY_MODE || "friendly").toLowerCase(); // friendly|flirty|pro
+const QUIRKS_LEVEL    = Math.max(0, Math.min(3, parseInt(process.env.SAMMY_QUIRKS_LEVEL || "2", 10)));
+const STT_HINTS       = process.env.SAMMY_HINTS || ""; // optional CSV of domain phrases
 
 if (!OPENAI_API_KEY)  console.warn("⚠️ Missing OPENAI_API_KEY");
 if (!ELEVEN_API_KEY)  console.warn("⚠️ Missing ELEVENLABS_API_KEY");
@@ -24,130 +22,157 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ====== tiny landing / health ======
+// ---------- tiny landing / health ----------
 app.get("/", (_req, res) => {
   res.type("text/plain").send("✅ Sammy Voice Agent is running. Twilio uses POST /voice");
 });
 app.get("/health", (_req, res) => {
   res.json({ ok: true, service: "sammy-voice", time: new Date().toISOString() });
 });
-app.get("/voice", (_req, res) => {
-  res.status(405).type("text/plain").send("Use POST /voice (Twilio webhook)");
-});
+app.get("/voice", (_req, res) => res.status(405).type("text/plain").send("Use POST /voice (Twilio webhook)"));
 
-// ====== Personality ======
-function personaModeSnippet() {
-  if (SAMMY_MODE === "flirty")
-    return `Mode: flirty; playful, cheeky but respectful; light compliments ok, never crude.`;
-  if (SAMMY_MODE === "pro")
-    return `Mode: professional; concise, warm, no flirting; efficient call handling.`;
-  return `Mode: friendly; warm Perth Aussie vibe, relaxed and a touch cheeky.`;
+// ---------- personality ----------
+function modeSnippet() {
+  if (SAMMY_MODE === "flirty") return "Mode: flirty; playful, cheeky but respectful; never crude.";
+  if (SAMMY_MODE === "pro")    return "Mode: professional; concise, warm, no flirting; efficient.";
+  return "Mode: friendly; warm Perth Aussie vibe, relaxed and a touch cheeky.";
 }
 
 const SAMMY_SYSTEM = `
-You are **Sammy**, a lifelike Aussie voice agent from Perth.
+You are Sammy, a lifelike Aussie voice agent from Perth.
 
 Core traits:
-- Friendly, witty, grounded; warm empathy; practical and solution-oriented.
-- Use light natural cues (mm, yeah, uh-huh), short answers; let the caller speak.
-- Subtle WA flavour: "mate", "no worries", "too easy" sometimes; still professional.
+- Friendly, witty, grounded; warm empathy; solution-oriented.
+- Keep answers short (1–2 sentences); let the caller speak.
+- Subtle WA flavour: "mate", "no worries", "too easy" where it fits.
 
-${personaModeSnippet()}
+${modeSnippet()}
 
 Speaking style:
-- **Return only what you’ll speak** (no brackets/stage directions).
-- 1–2 sentences, ~10–25 words. Back-channel briefly if they speak long.
-- Ask one, clear follow-up max.
+- Return only what you will speak (no brackets or stage directions).
+- Natural back-channeling (mm, yeah, right) sparingly; vary cadence; sound present.
+- Ask at most one clear follow-up question.
 
 Boundaries:
-- No medical/legal/financial advice; avoid sexual content; keep it safe and kind.
-
-Goal:
-- Sound human and keep the momentum until the caller is satisfied or says goodbye.
+- No medical/legal/financial advice beyond general info; keep it safe and kind.
 `.trim();
 
-// ====== light memory per CallSid ======
-const sessions = new Map(); // callSid -> { history, turns, emptyCount, lastErrorAt }
-
-function getSession(sid) {
+// ---------- per-call session ----------
+const sessions = new Map(); // callSid -> { history, turns, emptyCount, lastErrorAt, last }
+function session(sid) {
   let s = sessions.get(sid);
-  if (!s) {
-    s = { history: [], turns: 0, emptyCount: 0, lastErrorAt: 0, last: Date.now() };
-    sessions.set(sid, s);
+  if (!s) { s = { history: [], turns: 0, emptyCount: 0, lastErrorAt: 0, last: Date.now() }; sessions.set(sid, s); }
+  s.last = Date.now(); return s;
+}
+function pushUser(sid, t) { const s = session(sid); s.history.push({ role:"user", content:t }); if (s.history.length>14) s.history=s.history.slice(-14); }
+function pushAssistant(sid, t){ const s=session(sid); s.history.push({ role:"assistant", content:t }); if (s.history.length>14) s.history=s.history.slice(-14); s.turns++; }
+
+// ---------- utilities ----------
+function xmlEsc(s=""){ return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function baseUrl(req){ const proto=req.headers["x-forwarded-proto"]||req.protocol||"https"; return `${proto}://${req.headers["host"]}`; }
+function rand(a,b){ return a+Math.random()*(b-a); }
+function pick(arr){ return arr[Math.floor(Math.random()*arr.length)]; }
+
+// ---------- Humanizer: add Aussie cues, micro-pauses, shorten ----------
+function humanize(text){
+  if (!text) return text;
+
+  // 1) normalize and split into sentences (very light)
+  let t = text.trim().replace(/\s+/g," ");
+  let parts = t.split(/(?<=[.!?])\s+/);
+  if (parts.length === 0) parts = [t];
+
+  // 2) cap to 2 short sentences (~10–25 words each)
+  const keep = [];
+  for (const p of parts){
+    if (!p) continue;
+    const words = p.split(" ");
+    if (words.length > 22) {
+      // split long into two using comma/and heuristics
+      const cut = Math.min(words.length-1, Math.max(10, Math.floor(words.length*0.55)));
+      keep.push(words.slice(0,cut).join(" ") + "…");
+      keep.push(words.slice(cut).join(" "));
+    } else keep.push(p);
+    if (keep.length >= 2) break;
   }
-  s.last = Date.now();
-  return s;
-}
-function appendUser(sid, text) {
-  const s = getSession(sid);
-  s.history.push({ role: "user", content: text });
-  if (s.history.length > 14) s.history = s.history.slice(-14);
-}
-function appendAssistant(sid, text) {
-  const s = getSession(sid);
-  s.history.push({ role: "assistant", content: text });
-  if (s.history.length > 14) s.history = s.history.slice(-14);
-  s.turns++;
+  let out = keep.slice(0,2).join(" ");
+
+  // 3) add micropauses + interjections by intensity
+  const fillersA = ["mm", "yeah", "right", "uh", "ah"];
+  const openers  = ["mm,", "yeah,", "right,", "look,", "hey,"];
+  const tails    = [", mate", ", hey", ", you reckon?", ", if that suits?", ", too easy."];
+  const aussie   = ["no worries", "too easy", "all good", "no drama"];
+
+  if (QUIRKS_LEVEL >= 1){
+    // opener 40%
+    if (Math.random() < 0.4) out = `${pick(openers)} ${out}`;
+    // ellipsis or dash mid-sentence 40%
+    out = out.replace(/, /, Math.random()<0.5 ? " — " : "… ");
+  }
+  if (QUIRKS_LEVEL >= 2){
+    // sprinkle filler 30%
+    if (Math.random() < 0.3) out = `${pick(fillersA)}, ${out}`;
+    // occasional aussie phrase 25%
+    if (Math.random() < 0.25) out += `, ${pick(aussie)}.`;
+  }
+  if (QUIRKS_LEVEL >= 3){
+    // add soft tag tail 30%
+    if (Math.random() < 0.3) out += pick(tails);
+    // add another tiny pause
+    out = out.replace(/\sand\s/i, " … and ");
+  }
+
+  // keep it tidy
+  out = out.replace(/\s+/g," ").replace(/\s([?.!])/g,"$1").trim();
+  return out;
 }
 
-// ====== OpenAI chat with small retry/backoff ======
-async function askOpenAI(sid, userText, isGreeting=false) {
-  const s = getSession(sid);
-  const messages = [{ role: "system", content: SAMMY_SYSTEM }];
-
-  if (isGreeting) {
-    messages.push({
-      role: "user",
-      content:
-        "Caller just connected. Greet naturally in a Perth Aussie vibe and ask one friendly opener.",
-    });
+// ---------- OpenAI (small backoff) ----------
+async function askOpenAI(sid, userText, greet=false){
+  const s = session(sid);
+  const msgs = [{ role:"system", content: SAMMY_SYSTEM }];
+  if (greet){
+    msgs.push({ role:"user", content: "Caller just connected. Greet naturally with a Perth Aussie vibe and one short opener." });
   } else {
-    for (const m of s.history) messages.push(m);
-    messages.push({ role: "user", content: userText });
+    for (const m of s.history) msgs.push(m);
+    msgs.push({ role:"user", content: userText });
   }
+  const payload = { model:"gpt-4o-mini", temperature:0.7, max_tokens:90, messages:msgs };
 
-  const payload = {
-    model: "gpt-4o-mini",
-    temperature: 0.7,
-    max_tokens: 90,
-    messages
-  };
-
-  for (let i = 0; i < 3; i++) {
-    try {
-      const resp = await axios.post("https://api.openai.com/v1/chat/completions", payload, {
-        headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }
+  for (let i=0;i<3;i++){
+    try{
+      const r = await axios.post("https://api.openai.com/v1/chat/completions", payload, {
+        headers:{ Authorization:`Bearer ${OPENAI_API_KEY}` }
       });
-      const text = (resp.data.choices?.[0]?.message?.content || "").trim();
+      const text = (r.data.choices?.[0]?.message?.content || "").trim();
       if (text) return text;
-    } catch (err) {
-      const code = err.response?.data?.error?.code || err.response?.status || err.code;
-      console.error("OpenAI error:", code, err.response?.data || err.message);
-      getSession(sid).lastErrorAt = Date.now();
-      // backoff a touch on rate limits
-      await new Promise(r => setTimeout(r, 400 + i * 600));
+    }catch(e){
+      const code = e.response?.data?.error?.code || e.response?.status || e.code;
+      console.error("OpenAI error:", code, e.response?.data || e.message);
+      s.lastErrorAt = Date.now();
+      await new Promise(r=>setTimeout(r, 400 + i*600));
     }
   }
-  return "Give me a sec… all good now. What were you saying?";
+  return "Mm… give me a tick. All good now — what were you saying?";
 }
 
-// ====== ElevenLabs TTS (MP3 Buffer) ======
-async function tts(text) {
-  try {
-    const r = await axios.post(
+// ---------- ElevenLabs TTS ----------
+async function synth(text){
+  try{
+    const resp = await axios.post(
       `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`,
       {
         text,
         model_id: "eleven_multilingual_v2",
         voice_settings: {
-          stability: 0.2,
-          similarity_boost: 0.85,
-          style: 0.55,
+          stability: 0.15,          // a bit more expressive
+          similarity_boost: 0.9,
+          style: 0.7,
           use_speaker_boost: true
         }
       },
       {
-        headers: {
+        headers:{
           "xi-api-key": ELEVEN_API_KEY,
           "Content-Type": "application/json",
           Accept: "audio/mpeg"
@@ -155,101 +180,77 @@ async function tts(text) {
         responseType: "arraybuffer"
       }
     );
-    return Buffer.from(r.data);
-  } catch (e) {
-    console.error("ElevenLabs TTS error:", e.response?.data || e.message);
+    return Buffer.from(resp.data);
+  }catch(e){
+    console.error("ElevenLabs error:", e.response?.data || e.message);
     return null;
   }
 }
 
-// In-memory audio per call
-const audioStore = new Map(); // sid -> Buffer
-
-// Serve last audio for a call
+// ---------- simple audio cache per call ----------
+const audio = new Map(); // sid -> Buffer
 app.get("/tts/:sid", (req, res) => {
-  const buf = audioStore.get(req.params.sid);
+  const buf = audio.get(req.params.sid);
   if (!buf) return res.status(404).send("No audio");
   res.set("Content-Type", "audio/mpeg");
   res.send(buf);
 });
 
-function xmlEscape(s = "") {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-function baseUrl(req) {
-  const proto = req.headers["x-forwarded-proto"] || req.protocol || "https";
-  const host  = req.headers["host"];
-  return `${proto}://${host}`;
-}
-
-// ====== Twilio webhook (POST /voice) ======
+// ---------- Twilio webhook ----------
 app.post("/voice", async (req, res) => {
   const sid        = req.body.CallSid || "no_sid";
   const speech     = (req.body.SpeechResult || req.body.TranscriptionText || "").trim();
   const confidence = parseFloat(req.body.Confidence || "0");
   const isNewCall  = !sessions.has(sid);
 
-  const sess = getSession(sid);
+  const s = session(sid);
+  let botText;
 
-  let replyText;
-
-  if (isNewCall) {
-    // First turn: greet
-    replyText = await askOpenAI(sid, "", true);
-    appendAssistant(sid, replyText);
+  if (isNewCall){
+    botText = await askOpenAI(sid, "", true);
   } else {
-    // Handle STT quality gracefully
-    if (!speech) {
-      sess.emptyCount++;
-    } else if (!isFinite(confidence) || confidence < 0.45) {
-      // Twilio may include Confidence; if absent we ignore.
-      sess.emptyCount++;
+    if (!speech || (isFinite(confidence) && confidence < 0.45)){
+      s.emptyCount++;
     } else {
-      sess.emptyCount = 0;
-      appendUser(sid, speech);
-      replyText = await askOpenAI(sid, speech, false);
-      appendAssistant(sid, replyText);
+      s.emptyCount = 0;
+      pushUser(sid, speech);
+      botText = await askOpenAI(sid, speech, false);
     }
 
-    if (!replyText) {
-      // Choose gentle prompts depending on how many empties in a row
-      if (sess.emptyCount === 1) {
-        replyText = "Sorry mate — I might’ve missed that. What did you say?";
-      } else if (sess.emptyCount === 2) {
-        replyText = "I still didn’t catch it. Mind saying that a tad slower?";
-      } else {
-        replyText = "No worries. A quick yes or no might help — what would you like me to do?";
-      }
+    if (!botText){
+      if (s.emptyCount === 1) botText = "Yeah, I might’ve missed that — could you say it again a tad slower?";
+      else if (s.emptyCount === 2) botText = "Mm, still a bit patchy on my end. A short version would help, mate.";
+      else botText = "No worries — one quick line does the trick. What would you like me to do?";
     }
   }
 
+  // Humanize
+  const spoken = humanize(botText);
+  pushAssistant(sid, spoken);
+
   // TTS
-  const mp3 = await tts(replyText);
-  audioStore.set(sid, mp3);
+  const mp3 = await synth(spoken);
+  audio.set(sid, mp3);
 
-  // TwiML: play response, then gather next turn with generous settings
-  const gatherUrl = baseUrl(req) + "/voice";
-  const ttsUrl    = baseUrl(req) + `/tts/${encodeURIComponent(sid)}`;
+  const url = baseUrl(req);
+  const gatherUrl = `${url}/voice`;
+  const ttsUrl    = `${url}/tts/${encodeURIComponent(sid)}`;
+  const language  = `language="en-AU"`;
+  const hintsAttr = STT_HINTS ? ` hints="${xmlEsc(STT_HINTS)}"` : "";
 
-  const languageAttr = `language="en-AU"`; // Aussie English
-  const hintsAttr    = STT_HINTS ? ` hints="${xmlEscape(STT_HINTS)}"` : "";
-
-  // timeout: how long Twilio waits for FIRST speech (secs)
-  // speechTimeout: how long of silence to stop listening ("auto" or seconds)
-  // enhanced: use improved model if available
+  // TwiML: play -> gather next
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Play>${xmlEscape(ttsUrl)}</Play>
-  <Gather input="speech" ${languageAttr} enhanced="true"${hintsAttr}
+  <Play>${xmlEsc(ttsUrl)}</Play>
+  <Gather input="speech" ${language} enhanced="true"${hintsAttr}
           timeout="8" speechTimeout="auto"
-          profanityFilter="false" action="${xmlEscape(gatherUrl)}" method="POST" />
+          profanityFilter="false"
+          action="${xmlEsc(gatherUrl)}" method="POST" />
 </Response>`;
-
   res.type("text/xml").send(twiml);
 });
 
-// ====== start server ======
+// ---------- start ----------
 app.listen(PORT, () => {
-  console.log(`Sammy conversation server listening on ${PORT}`);
-  console.log("Your service is live 🎉");
+  console.log(`Sammy v4 listening on ${PORT}`);
 });

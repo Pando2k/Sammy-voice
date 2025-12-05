@@ -1,31 +1,46 @@
 import express from "express";
+import twilio from "twilio";
 
 const app = express();
+const { twiml: { VoiceResponse } } = twilio;
 
-// Twilio may send urlencoded form data; we don't need JSON here
+// Parse application/x-www-form-urlencoded like Twilio sends
 app.use(express.urlencoded({ extended: false }));
 
-// ---- Voice endpoint (handles both POST and GET) ----
-const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="Polly.Nicole-Neural">Hi, it's Sammy. How can I help you today?</Say>
-</Response>`;
+// ---- Voice webhook: accept both POST and GET just in case ----
+const handleVoice = (req, res) => {
+  try {
+    // Log a few useful fields (shows up in Render logs)
+    console.log("Voice webhook hit:", {
+      method: req.method,
+      from: req.body.From,
+      to: req.body.To,
+      callSid: req.body.CallSid
+    });
 
-app.post("/voice", (req, res) => {
-  res.type("text/xml").send(twiml);
-});
+    const response = new VoiceResponse();
+    response.say(
+      { voice: "Polly.Nicole-Neural" },  // AU female neural voice
+      "Hi, it's Sammy. How can I help you today?"
+    );
 
-app.get("/voice", (req, res) => {
-  // In case Twilio is configured as GET by mistake
-  res.type("text/xml").send(twiml);
-});
+    res.type("text/xml");
+    res.status(200).send(response.toString());
+  } catch (err) {
+    console.error("Webhook error:", err);
+    res.status(500).send("<Response><Say>Sorry, an error occurred.</Say></Response>");
+  }
+};
 
-// Default homepage (warming check)
+// Accept POST (normal Twilio) and GET (fallback if misconfigured)
+app.post("/voice", handleVoice);
+app.get("/voice", handleVoice);
+
+// Simple home page (helps wake free Render dyno)
 app.get("/", (_req, res) => {
   res.send("Sammy Voice Server is running!");
 });
 
+// Use Render port
 const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
-});
+app.listen(port, () => console.log(`Server running on port ${port}`));

@@ -2,49 +2,45 @@ import express from "express";
 import twilio from "twilio";
 
 const app = express();
-const { VoiceResponse } = twilio;
+const { VoiceResponse } = twilio.twiml;
 
-// Parse form-encoded payloads (what Twilio sends)
+// Twilio posts x-www-form-urlencoded
 app.use(express.urlencoded({ extended: false }));
 
-// ---- Voice Webhook Handler ----
+// ---- Voice webhook handler (safe / unthrowable) ----
 const handleVoice = (req, res) => {
   try {
+    const b = req.body || {}; // guard against undefined on odd GET/probes
     console.log("Voice webhook hit:", {
       method: req.method,
-      from: req.body.From,
-      to: req.body.To,
-      callSid: req.body.CallSid
+      from: b.From,
+      to: b.To,
+      callSid: b.CallSid,
     });
 
-    const response = new VoiceResponse();
+    const vr = new VoiceResponse();
+    vr.say({ voice: "Polly.Nicole-Neural" }, "Hi, it's Sammy. How can I help you today?");
 
-    response.say(
-      { voice: "Polly.Nicole-Neural" },  // Strong Australian female voice
-      "Hi, it's Sammy. How can I help you today?"
-    );
-
-    res.type("text/xml");
-    res.status(200).send(response.toString());
+    res.type("text/xml").status(200).send(vr.toString());
   } catch (err) {
     console.error("Webhook error:", err);
-    res
-      .status(500)
-      .send(
-        `<Response><Say>Sorry, an error occurred.</Say></Response>`
-      );
+
+    // Always send valid TwiML + 200 so Twilio doesn't error/retry
+    const vr = new VoiceResponse();
+    vr.say("Sorry, an error occurred.");
+    res.type("text/xml").status(200).send(vr.toString());
   }
 };
 
-// Accept both POST (normal Twilio) and GET (fallback)
+// Support POST (normal) and GET (fallback/health)
 app.post("/voice", handleVoice);
 app.get("/voice", handleVoice);
 
-// Homepage
-app.get("/", (_, res) => {
-  res.send("Sammy Voice Server is running!");
+// Simple home page
+app.get("/", (_req, res) => {
+  res.status(200).send("Sammy Voice Server is running!");
 });
 
-// Render uses PORT environment variable
+// Render provides PORT env; default for local
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Server running on port ${port}`));

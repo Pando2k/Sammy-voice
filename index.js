@@ -1,139 +1,94 @@
 import express from "express";
 import twilio from "twilio";
-
-const ELEVEN_API_KEY = process.env.ELEVENLABS_API_KEY || "";
-const ELEVEN_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "";
+import axios from "axios";
 
 const app = express();
 const { VoiceResponse } = twilio.twiml;
 
 app.use(express.urlencoded({ extended: false }));
 
-// health
-app.get("/", (_req, res) => res.send("Sammy Voice Agent is running!"));
+// --- Env vars from Render ---
+const ELEVEN_API_KEY   = process.env.ELEVENLABS_API_KEY; // required
+const ELEVEN_VOICE_ID  = process.env.ELEVENLABS_VOICE_ID; // required
+const ELEVEN_MODEL_ID  = process.env.ELEVENLABS_MODEL_ID || "eleven_turbo_v2"; // optional
 
-// serve synthesized audio
-app.get("/audio/:file", (req, res) => {
-  res.setHeader("Cache-Control", "public, max-age=300");
-  res.sendFile(`/tmp/${req.params.file}`, { root: "/" }, (err) => {
-    if (err) res.status(404).end();
-  });
+// Tiny health check
+app.get("/", (_, res) => res.send("Sammy Voice Server is running!"));
+
+// Generate an MP3 with ElevenLabs on the fly and stream it back
+app.get("/greet.mp3", async (req, res) => {
+  try {
+    if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) {
+      res.status(500).send("Missing ELEVENLABS_API_KEY or ELEVENLABS_VOICE_ID");
+      return;
+    }
+
+    const text = "Hi, it's Sammy. How can I help you today?";
+
+    const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`;
+    const resp = await axios.post(
+      url,
+      {
+        text,
+        model_id: ELEVEN_MODEL_ID,       // uses your model, or the default
+        // You can fine-tune style here if you want:
+        // voice_settings: { stability: 0.5, similarity_boost: 0.8, style: 0.3, use_speaker_boost: true }
+      },
+      {
+        headers: {
+          "xi-api-key": ELEVEN_API_KEY,
+          "Content-Type": "application/json",
+          "Accept": "audio/mpeg"
+        },
+        responseType: "arraybuffer"
+      }
+    );
+
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.send(Buffer.from(resp.data));
+  } catch (err) {
+    console.error("ElevenLabs TTS error:", err?.response?.status, err?.response?.data || err.message);
+    res.status(500).send("TTS failed");
+  }
 });
 
-// ---------- entry: gather speech ----------
-app.all("/voice", (req, res) => {
+// Twilio Voice webhook – plays the ElevenLabs audio
+app.post("/voice", (req, res) => {
+  try {
+    // Build absolute URL for /greet.mp3 (Render can be under your custom host)
+    const base =
+      `${req.headers["x-forwarded-proto"] || req.protocol}://${req.headers.host}`;
+
+    const vr = new VoiceResponse();
+    vr.play(`${base}/greet.mp3`);
+
+    // Optional: start listening for speech after the greeting
+    const g = vr.gather({
+      input: "speech",
+      action: "/handle-speech",
+      method: "POST",
+      speechTimeout: "auto",
+      timeout: 5
+    });
+    // You can also add a short tone or silence here if you want
+
+    res.type("text/xml").status(200).send(vr.toString());
+  } catch (err) {
+    console.error("Webhook error:", err);
+    const vr = new VoiceResponse();
+    vr.say("Sorry, an error occurred.");
+    res.type("text/xml").status(200).send(vr.toString());
+  }
+});
+
+// Just echoes that we heard you (placeholder for real NLU/agent)
+app.post("/handle-speech", (req, res) => {
   const vr = new VoiceResponse();
-
-  // ALWAYS call our action, even if Twilio hears nothing
-  const g = vr.gather({
-    input: "speech",
-    language: "en-AU",
-    speechTimeout: "auto",
-    timeout: 6,
-    actionOnEmptyResult: true,
-    action: "/handle_speech",
-    method: "POST"
-  });
-
-  // Initial prompt (Twilio TTS just to start the convo)
-  g.say({ voice: "alice", language: "en-AU" },
-        "Hi, it's Sammy. How can I help you today?");
-
-  // If gather didn’t fire for any reason, reprompt by redirecting back here
-  vr.redirect("/voice");
-
+  vr.say("Thanks. I heard you. We’ll wire this to Sammy’s brain next.");
+  vr.hangup();
   res.type("text/xml").status(200).send(vr.toString());
 });
 
-// ---------- handle user speech, synth with ElevenLabs, loop ----------
-app.post("/handle_speech", async (req, res) => {
-  const vr = new VoiceResponse();
-  try {
-    const b = req.body || {};
-    console.log("HANDLE_SPEECH body:", JSON.stringify(b));
-
-    const user = (b.SpeechResult || "").trim();
-    const reply = buildReply(user);
-
-    const fileName = `sammy_${Date.now()}.mp3`;
-    const ok = await synthElevenLabs(reply, `/tmp/${fileName}`);
-
-    if (ok) {
-      const host = req.headers["x-forwarded-host"] || req.headers.host;
-      const base = `https://${host}`;
-      vr.play(`${base}/audio/${fileName}`);
-    } else {
-      vr.say({ voice: "alice", language: "en-AU" }, reply);
-    }
-
-    // keep the conversation going
-    vr.redirect("/voice");
-    res.type("text/xml").status(200).send(vr.toString());
-  } catch (e) {
-    console.error("handle_speech error:", e);
-    vr.say({ voice: "alice", language: "en-AU" },
-           "Sorry, something went wrong. Let's try again.");
-    vr.redirect("/voice");
-    res.type("text/xml").status(200).send(vr.toString());
-  }
-});
-
-// ---------- tiny rule-based brain ----------
-function buildReply(user) {
-  if (!user) return "I didn’t catch that. Could you say that again?";
-  const u = user.toLowerCase();
-
-  if (/(hi|hello|hey)/.test(u)) return "Hi! I’m Sammy. What can I do for you?";
-  if (/name/.test(u)) return "I’m Sammy, your Aussie voice agent.";
-  if (/(help|support|problem|issue)/.test(u))
-    return "No worries. Tell me what’s happening and I’ll help.";
-  if (/(thank|thanks)/.test(u))
-    return "You’re welcome! Anything else I can do?";
-
-  return `You said: ${user}. Do you want me to take a message or help with something else?`;
-}
-
-// ---------- ElevenLabs TTS ----------
-async function synthElevenLabs(text, outPath) {
-  try {
-    if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) {
-      console.warn("Missing ELEVENLABS_API_KEY or ELEVENLABS_VOICE_ID");
-      return false;
-    }
-    const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}?optimize_streaming_latency=2`;
-    const r = await fetch(url, {
-      method: "POST",
-      headers: {
-        "xi-api-key": ELEVEN_API_KEY,
-        "Content-Type": "application/json",
-        "Accept": "audio/mpeg"
-      },
-      body: JSON.stringify({
-        text,
-        model_id: "eleven_monolingual_v1",
-        voice_settings: {
-          stability: 0.4,
-          similarity_boost: 0.85,
-          style: 0.2,
-          use_speaker_boost: true
-        }
-      })
-    });
-    if (!r.ok) {
-      console.error("ElevenLabs HTTP", r.status, await safeText(r));
-      return false;
-    }
-    const buf = Buffer.from(await r.arrayBuffer());
-    const fs = await import("node:fs/promises");
-    await fs.writeFile(outPath, buf);
-    return true;
-  } catch (e) {
-    console.error("synthElevenLabs exception:", e);
-    return false;
-  }
-}
-async function safeText(resp) { try { return await resp.text(); } catch { return "<no body>"; } }
-
-// ---------- port ----------
+// Render port
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Server running on port ${port}`));

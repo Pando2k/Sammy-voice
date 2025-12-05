@@ -2,12 +2,12 @@ import express from "express";
 import twilio from "twilio";
 
 const app = express();
-const { twiml: { VoiceResponse } } = twilio;
+const { VoiceResponse } = twilio;
 
-// Parse application/x-www-form-urlencoded like Twilio sends
+// Parse form-encoded payloads (what Twilio sends)
 app.use(express.urlencoded({ extended: false }));
 
-// ---- Voice webhook: accept both POST and GET ----
+// ---- Voice Webhook Handler ----
 const handleVoice = (req, res) => {
   try {
     console.log("Voice webhook hit:", {
@@ -20,7 +20,7 @@ const handleVoice = (req, res) => {
     const response = new VoiceResponse();
 
     response.say(
-      { voice: "Polly.Nicole-Neural" },
+      { voice: "Polly.Nicole-Neural" },  // Strong Australian female voice
       "Hi, it's Sammy. How can I help you today?"
     );
 
@@ -28,19 +28,23 @@ const handleVoice = (req, res) => {
     res.status(200).send(response.toString());
   } catch (err) {
     console.error("Webhook error:", err);
-    res.status(500).send("<Response><Say>Sorry, an error occurred.</Say></Response>");
+    res
+      .status(500)
+      .send(
+        `<Response><Say>Sorry, an error occurred.</Say></Response>`
+      );
   }
 };
 
-// Accept POST and GET
+// Accept both POST (normal Twilio) and GET (fallback)
 app.post("/voice", handleVoice);
 app.get("/voice", handleVoice);
 
 // Homepage
-app.get("/", (_req, res) => {
+app.get("/", (_, res) => {
   res.send("Sammy Voice Server is running!");
 });
 
-// Render port
+// Render uses PORT environment variable
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Server running on port ${port}`));

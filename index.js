@@ -10,7 +10,7 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ================= ENV =================
+// ====== ENV ======
 const OPENAI_API_KEY  = process.env.OPENAI_API_KEY;
 const ELEVEN_API_KEY  = process.env.ELEVENLABS_API_KEY;
 const ELEVEN_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
@@ -19,11 +19,11 @@ if (!OPENAI_API_KEY)  console.warn("⚠️ Missing OPENAI_API_KEY");
 if (!ELEVEN_API_KEY)  console.warn("⚠️ Missing ELEVENLABS_API_KEY");
 if (!ELEVEN_VOICE_ID) console.warn("⚠️ Missing ELEVENLABS_VOICE_ID");
 
-// ============ In-memory stores ============
-const audioStore = new Map(); // id -> Buffer (mp3)
-const sessions  = new Map(); // CallSid -> { history, greeted, turns, last }
+// ====== Stores ======
+const audioStore = new Map(); // id -> Buffer
+const sessions = new Map();   // CallSid -> { history, greeted, turns, last }
 
-// Session helpers
+// --- session helpers
 function getSession(callSid) {
   let s = sessions.get(callSid);
   if (!s) {
@@ -36,76 +36,75 @@ function getSession(callSid) {
 function appendUser(callSid, text) {
   const s = getSession(callSid);
   s.history.push({ role: "user", content: text });
-  if (s.history.length > 12) s.history = s.history.slice(-12);
+  if (s.history.length > 14) s.history = s.history.slice(-14);
 }
 function appendAssistant(callSid, text) {
   const s = getSession(callSid);
   s.history.push({ role: "assistant", content: text });
-  if (s.history.length > 12) s.history = s.history.slice(-12);
+  if (s.history.length > 14) s.history = s.history.slice(-14);
   s.turns += 1;
 }
 function shouldEnd(callSid, lastUserText, turns) {
-  const byeRegex = /\b(bye|goodbye|hang ?up|that'?s all|finish|stop|end)\b/i;
-  return byeRegex.test(lastUserText || "") || turns >= 30; // allow longer chats
+  const bye = /\b(bye|goodbye|hang ?up|that'?s all|finish|stop|end)\b/i;
+  return bye.test(lastUserText || "") || turns >= 32;
 }
 
-// ================ Utils =================
+// --- utils
+const xmlEscape = (s = "") =>
+  s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 function baseUrl(req) {
   const proto = req.headers["x-forwarded-proto"] || req.protocol || "https";
   return `${proto}://${req.get("host")}`;
 }
-const xmlEscape = (s = "") =>
-  s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
-// ================ OpenAI =================
+// ====== OpenAI with retry ======
 async function askOpenAI(callSid, userText, isGreeting = false) {
-  try {
-    const sys = `${sammyPersonality}
-Multi-turn rules:
-- Be concise and natural (1–2 sentences).
-- Add a gentle follow-up question when helpful.
-- Avoid over-apologising or sounding robotic.`;
+  const sys = `${sammyPersonality}
+Be concise and human. Never include stage directions.`;
 
-    const s = getSession(callSid);
-    const messages = [{ role: "system", content: sys }];
+  const s = getSession(callSid);
+  const messages = [{ role: "system", content: sys }];
 
-    // prior history
-    for (const m of s.history) messages.push(m);
+  for (const m of s.history) messages.push(m);
 
-    if (isGreeting) {
-      messages.push({
-        role: "user",
-        content: "Caller just connected. Offer a friendly Aussie greeting and ask how you can help."
-      });
-    } else {
-      messages.push({ role: "user", content: userText || "Continue the conversation." });
-    }
-
-    const resp = await axios.post(
-      "https://api.openai.com/v1/chat/completions",
-      {
-        model: "gpt-4o-mini",
-        messages,
-        temperature: 0.65,     // ↑ more chatty, ↓ more concise
-        max_tokens: 220,
-        presence_penalty: 0.2,
-        frequency_penalty: 0.2
-      },
-      {
-        headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-        timeout: 20000
-      }
-    );
-
-    const text = resp?.data?.choices?.[0]?.message?.content?.trim();
-    return text || "Righto. How can I help?";
-  } catch (err) {
-    console.error("OpenAI error:", err.response?.data || err.message);
-    return "Sorry mate, my brain glitched for a sec — what did you say?";
+  if (isGreeting) {
+    messages.push({
+      role: "user",
+      content: "Caller just connected. Greet naturally and ask how you can help."
+    });
+  } else {
+    messages.push({ role: "user", content: userText || "Continue the conversation." });
   }
+
+  // 3 tries with exponential backoff to survive rate limits
+  let lastErr;
+  for (let i = 0; i < 3; i++) {
+    try {
+      const resp = await axios.post(
+        "https://api.openai.com/v1/chat/completions",
+        {
+          model: "gpt-4o-mini",
+          messages,
+          temperature: 0.7,     // a bit more expressive
+          top_p: 0.9,
+          max_tokens: 200,
+          presence_penalty: 0.2,
+          frequency_penalty: 0.15
+        },
+        { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }, timeout: 20000 }
+      );
+      const text = resp?.data?.choices?.[0]?.message?.content?.trim();
+      return text || "Alright—how can I help?";
+    } catch (err) {
+      lastErr = err;
+      console.error("OpenAI error:", err.response?.data || err.message);
+      await new Promise(r => setTimeout(r, 800 * (i + 1))); // 0.8s, 1.6s
+    }
+  }
+  return "Sorry, I’m hitting a traffic jam on my end—could you say that again?";
 }
 
-// =============== ElevenLabs TTS ===============
+// ====== ElevenLabs TTS (more expressive) ======
 async function ttsElevenLabs(text) {
   if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) return null;
   try {
@@ -116,9 +115,9 @@ async function ttsElevenLabs(text) {
         text,
         model_id: "eleven_multilingual_v2",
         voice_settings: {
-          stability: 0.2,          // lower = more expressive
-          similarity_boost: 0.9,   // higher = closer to the voice
-          style: 0.55,
+          stability: 0.35,         // a little looser = more natural
+          similarity_boost: 0.8,
+          style: 0.7,              // a touch more expressive
           use_speaker_boost: true
         }
       },
@@ -139,7 +138,7 @@ async function ttsElevenLabs(text) {
   }
 }
 
-// ============ Small GET routes ============
+// ====== Simple GETs ======
 app.get("/", (_req, res) => {
   res.type("text/plain").send("✅ Sammy Voice Agent is running. Twilio uses POST /voice");
 });
@@ -159,25 +158,28 @@ app.get("/audio/:id", (req, res) => {
   res.send(buf);
 });
 
-// ============ TwiML builders ============
+// ====== TwiML helpers ======
 function twimlGather({ promptSay, promptPlayUrl, action = "/voice" }) {
   const say = promptPlayUrl
     ? `<Play>${promptPlayUrl}</Play>`
     : `<Say language="en-AU" voice="Polly.Nicole-Neural">${xmlEscape(promptSay)}</Say>`;
 
-  // actionOnEmptyResult keeps the loop if caller is silent
-  const twiml =
-    `<?xml version="1.0" encoding="UTF-8"?>` +
-    `<Response>` +
-      `<Gather input="speech" language="en-AU" action="${action}" method="POST" speechTimeout="auto" actionOnEmptyResult="true" hints="${xmlEscape('yes,no,okay,booking,order,account,email,address,Perth,Australia')}">` +
-        `${say}` +
-      `</Gather>` +
-      `<Redirect method="POST">${action}</Redirect>` +
-    `</Response>`;
-  return twiml;
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Gather input="speech"
+          language="en-AU"
+          action="${action}"
+          method="POST"
+          speechTimeout="auto"
+          actionOnEmptyResult="true"
+          hints="${xmlEscape('yes,no,okay,booking,order,account,email,address,Perth,Australia')}">
+    ${say}
+  </Gather>
+  <Redirect method="POST">${action}</Redirect>
+</Response>`;
 }
 
-function twimlGoodbye(text = "No worries — I’ll let you go. Have a good one!") {
+function twimlGoodbye(text = "Too easy—thanks for the chat. Have a good one!") {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say language="en-AU" voice="Polly.Nicole-Neural">${xmlEscape(text)}</Say>
@@ -185,21 +187,18 @@ function twimlGoodbye(text = "No worries — I’ll let you go. Have a good one!
 </Response>`;
 }
 
-// ============ Main Twilio webhook ============
+// ====== Main webhook ======
 app.post("/voice", async (req, res) => {
   const callSid = req.body.CallSid || "unknown";
   const speech  = (req.body.SpeechResult || req.body.TranscriptionText || "").trim();
-  const hasSpeech = Boolean(speech);
-
   const s = getSession(callSid);
 
-  // First turn: greet once
+  // First turn
   if (!s.greeted) {
     s.greeted = true;
     const reply = await askOpenAI(callSid, "", true);
     appendAssistant(callSid, reply);
 
-    // TTS preferred
     let playUrl = null;
     const mp3 = await ttsElevenLabs(reply);
     if (mp3) {
@@ -209,29 +208,23 @@ app.post("/voice", async (req, res) => {
       playUrl = `${baseUrl(req)}/audio/${id}`;
     }
 
-    const twiml = twimlGather({ promptSay: reply, promptPlayUrl: playUrl });
-    res.type("text/xml").send(twiml);
+    res.type("text/xml").send(twimlGather({ promptSay: reply, promptPlayUrl: playUrl }));
     return;
   }
 
-  // Conversation turns
-  const userText = hasSpeech ? speech : "";
-  if (hasSpeech) appendUser(callSid, userText);
+  // Subsequent turns
+  const userText = speech;
+  if (userText) appendUser(callSid, userText);
 
   if (shouldEnd(callSid, userText, s.turns)) {
-    const bye = "Too easy — I’ll let you go. Thanks for the chat!";
-    res.type("text/xml").send(twimlGoodbye(bye));
+    res.type("text/xml").send(twimlGoodbye());
     sessions.delete(callSid);
     return;
   }
 
-  // If silent → reprompt softly
-  const reprompt = !hasSpeech;
-
   const reply = await askOpenAI(callSid, userText, false);
   appendAssistant(callSid, reply);
 
-  // TTS preferred
   let playUrl = null;
   const mp3 = await ttsElevenLabs(reply);
   if (mp3) {
@@ -241,21 +234,17 @@ app.post("/voice", async (req, res) => {
     playUrl = `${baseUrl(req)}/audio/${id}`;
   }
 
-  const prompt = reprompt
-    ? "Sorry, I didn’t catch that — could you say that again?"
-    : reply;
-
-  const twiml = twimlGather({ promptSay: prompt, promptPlayUrl: playUrl });
-  res.type("text/xml").send(twiml);
+  const prompt = userText ? reply : "Sorry, I didn’t catch that—what did you say?";
+  res.type("text/xml").send(twimlGather({ promptSay: prompt, promptPlayUrl: playUrl }));
 });
 
-// ============ Start server ============
+// ====== Server ======
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`Sammy conversation server listening on ${PORT}`);
 });
 
-// ============ Cleanup old sessions ============
+// Cleanup stale sessions every 5 minutes
 setInterval(() => {
   const now = Date.now();
   for (const [sid, s] of sessions.entries()) {

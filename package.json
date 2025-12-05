@@ -1,19 +1,12 @@
 {
   "name": "sammy-voice",
   "version": "1.0.0",
-  "description": "Sammy realtime voice agent (Twilio + OpenAI + ElevenLabs) on Render",
   "type": "module",
   "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
-  "engines": {
-    "node": "18.x"
-  },
+  "scripts": { "start": "node index.js" },
+  "engines": { "node": "18.x" },
   "dependencies": {
-    "express": "^4.19.2",
     "dotenv": "^16.4.5",
-    "openai": "^4.59.1",
-    "node-fetch": "^3.3.2"
+    "express": "^4.19.2"
   }
 }

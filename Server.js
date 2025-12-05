@@ -1,208 +1,326 @@
-// server.js — Sammy v5 FAST (tight turn-taking + light quirks)
+// server.js  — Sammy v3 (Realistic + Low-Latency, chunked replies)
+// ---------------------------------------------------------------
+// What this version does better:
+// - Short, fast turns (no long monologues)
+// - Chunked reply: speak first sentence ASAP, then continue
+// - Human disfluencies (light "mm", "yeah", soft laughs) injected tastefully
+// - Natural Aussie tone + guardrails
+// - Interrupt-friendly Twilio <Gather> barge-in flow
+//
+// Env vars used (Render -> Environment Variables):
+// OPENAI_API_KEY
+// ELEVENLABS_API_KEY
+// ELEVENLABS_VOICE_ID
+// SAMMY_MODE              (flirty | pro)           [optional]
+// QUIRKS_LEVEL            (0..3)                   [optional, default 2]
+// STT_HINTS               (comma separated hints)  [optional]
+// GREETING_OVERRIDE       (string)                 [optional]
 
-const express = require("express");
-const dotenv = require("dotenv");
-const axios = require("axios");
+import express from "express";
+import dotenv from "dotenv";
+import axios from "axios";
+import { v4 as uuidv4 } from "uuid";
 
 dotenv.config();
-
-const PORT = process.env.PORT || 10000;
-const OPENAI_API_KEY  = process.env.OPENAI_API_KEY || "";
-const ELEVEN_API_KEY  = process.env.ELEVENLABS_API_KEY || "";
-const ELEVEN_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "";
-const SAMMY_MODE      = (process.env.SAMMY_MODE || "friendly").toLowerCase(); // friendly|flirty|pro
-const QUIRKS_LEVEL    = Math.max(0, Math.min(3, parseInt(process.env.SAMMY_QUIRKS_LEVEL || "1", 10))); // default lighter
-const STT_HINTS       = process.env.SAMMY_HINTS || "";
-
-if (!OPENAI_API_KEY)  console.warn("⚠️ Missing OPENAI_API_KEY");
-if (!ELEVEN_API_KEY)  console.warn("⚠️ Missing ELEVENLABS_API_KEY");
-if (!ELEVEN_VOICE_ID) console.warn("⚠️ Missing ELEVENLABS_VOICE_ID");
-
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// -------- landing / health
-app.get("/", (_req, res) => res.type("text/plain").send("✅ Sammy FAST is running. Twilio uses POST /voice"));
-app.get("/health", (_req, res) => res.json({ ok:true, service:"sammy-voice-fast", time:new Date().toISOString() }));
-app.get("/voice", (_req, res) => res.status(405).type("text/plain").send("Use POST /voice (Twilio webhook)"));
+// ====== ENV ======
+const OPENAI_API_KEY    = process.env.OPENAI_API_KEY || "";
+const ELEVEN_API_KEY    = process.env.ELEVENLABS_API_KEY || "";
+const ELEVEN_VOICE_ID   = process.env.ELEVENLABS_VOICE_ID || "";
+const SAMMY_MODE        = (process.env.SAMMY_MODE || "").toLowerCase(); // "", "flirty", "pro"
+const QUIRKS_LEVEL      = Math.max(0, Math.min(3, Number(process.env.QUIRKS_LEVEL || 2)));
+const STT_HINTS         = (process.env.STT_HINTS || "").trim();
+const GREETING_OVERRIDE = (process.env.GREETING_OVERRIDE || "").trim();
+const TWILIO_SPEECH_MODEL = process.env.TWILIO_SPEECH_MODEL || "mmm"; // faster STT on Twilio side (documented to them)
 
-// -------- system prompt
-function modeSnippet() {
-  if (SAMMY_MODE === "flirty") return "Mode: flirty; playful but respectful.";
-  if (SAMMY_MODE === "pro")    return "Mode: professional; concise, warm, efficient.";
-  return "Mode: friendly; relaxed Perth Aussie vibe.";
+// ====== in-memory audio store ======
+const audioStore = new Map(); // id -> Buffer
+
+// ====== tiny helpers ======
+const xmlEscape = (s="") =>
+  s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+
+const baseUrl = (req) => {
+  const proto = req.headers["x-forwarded-proto"] || req.protocol || "https";
+  return `${proto}://${req.get("host")}`;
+};
+
+// ====== Personality v3 ======
+// “Human realism” prompt with Aussie warmth and short turns.
+function systemPersona() {
+  const modeLine = SAMMY_MODE === "flirty"
+    ? "Flirt lightly when invited, keep it classy and kind."
+    : (SAMMY_MODE === "pro"
+        ? "Professional, calm, and reassuring when needed."
+        : "Friendly Aussie vibe.");
+
+  return `
+You are **Sammy**, a lifelike Aussie voice agent from Perth.
+Core style:
+- Warm, grounded; practical; friendly humour.
+- Very short turns (1–2 sentences). Offer to continue.
+- Invite the caller back with a soft tag (“yeah?” “sound good?”).
+- Respect interruptions; if user starts speaking, stop and listen.
+- No stage directions in your text.
+
+Speech feel:
+- Subtle disfluencies that *sound natural*: “mm”, “yeah”, soft breath, tiny chuckles.
+- Use them sparingly (never every sentence). Keep them short.
+- Aussie rhythm: “mate” sometimes, “no worries”, “righto”, “too easy”.
+
+Boundaries:
+- Avoid medical/legal/financial decisions; steer to safe help.
+- No profanity or sexual content unless the user explicitly asks and it's harmless. Keep it classy.
+
+${modeLine}
+Return only what you *will say aloud* (no brackets, no scene text).`;
 }
 
-const SAMMY_SYSTEM = `
-You are Sammy, a lifelike Aussie voice agent from Perth.
+// inject tiny human-like quirks without overdoing it
+function sprinkleQuirks(text) {
+  if (QUIRKS_LEVEL <= 0) return text;
 
-Keep replies short (1–2 lines, ~12–18 words), helpful, present.
-Subtle WA flavour: "mate", "no worries", "too easy" when natural.
-Never include stage directions or bracketed text.
+  const tiny = ["mm", "yeah", "uh", "right", "okay"];
+  const soft = ["(soft laugh)", "(small breath)"];
+  // We don't keep the parentheses in final speech; we transform to punctuation later.
 
-${modeSnippet()}
+  let out = text;
 
-Ask at most one clear follow-up question.
-Boundaries: no medical/legal/financial advice beyond general info.
-`.trim();
-
-// -------- sessions
-const sessions = new Map(); // callSid -> { history, turns, emptyCount, last }
-function sess(id){ let s=sessions.get(id); if(!s){ s={history:[],turns:0,emptyCount:0,last:Date.now()}; sessions.set(id,s);} s.last=Date.now(); return s; }
-function pushUser(id,t){const s=sess(id); s.history.push({role:"user",content:t}); if(s.history.length>12) s.history=s.history.slice(-12);}
-function pushBot (id,t){const s=sess(id); s.history.push({role:"assistant",content:t}); if(s.history.length>12) s.history=s.history.slice(-12); s.turns++;}
-
-// -------- utils
-function xmlEsc(s=""){return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
-function baseUrl(req){const proto=req.headers["x-forwarded-proto"]||req.protocol||"https";return `${proto}://${req.headers["host"]}`;}
-function pick(a){return a[Math.floor(Math.random()*a.length)];}
-
-// -------- light humanizer (fast)
-function humanize(text){
-  if(!text) return text;
-  let t = text.trim().replace(/\s+/g," ");
-
-  // sentence split and HARD cap
-  let parts = t.split(/(?<=[.!?])\s+/).filter(Boolean);
-  if (parts.length === 0) parts = [t];
-  const keep = [];
-  for (const p of parts){
-    const words = p.split(" ");
-    if (words.length > 18) {
-      keep.push(words.slice(0, Math.min(16, Math.floor(words.length*0.6))).join(" ") + ".");
-    } else {
-      keep.push(p);
-    }
-    if (keep.length >= 2) break;
+  // Small chance to add a 2-word tag at start
+  if (Math.random() < 0.25 * QUIRKS_LEVEL) {
+    const tag = tiny[Math.floor(Math.random() * tiny.length)];
+    out = `${tag}, ${out}`;
   }
-  t = keep.slice(0,2).join(" ");
 
-  // modest Aussie flavour without long pauses
-  if (QUIRKS_LEVEL >= 1){
-    if (Math.random()<0.2) t = "yeah, " + t;                  // 20% opener
-    if (Math.random()<0.2) t = t.replace(", ", " — ");        // tiny micro-pause
+  // Occasionally drop a soft cue mid-sentence
+  if (Math.random() < 0.20 * QUIRKS_LEVEL) {
+    const cue = tiny[Math.floor(Math.random() * tiny.length)];
+    out = out.replace(/, /, `, ${cue}, `);
   }
-  if (QUIRKS_LEVEL >= 2){
-    if (Math.random()<0.2) t += " no worries.";               // small tail
+
+  // Rare soft effects -> convert to subtle punctuation later
+  if (Math.random() < 0.10 * QUIRKS_LEVEL) {
+    out += " (small breath)";
   }
-  // level 3 would add a touch more, but keep pauses minimal
-  return t.replace(/\s([?.!])/g,"$1").trim();
+
+  // Translate soft effects to punctuation ElevenLabs performs well with
+  out = out
+    .replace(/\(small breath\)/gi, "…")
+    .replace(/\(soft laugh\)/gi, "…")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+
+  // keep it short
+  if (out.split(" ").length > 36) {
+    out = out.split(". ").slice(0, 2).join(". ");
+  }
+  return out;
 }
 
-// -------- OpenAI (fast)
-async function askOpenAI(callSid, userText, greet=false){
-  const s = sess(callSid);
-  const messages = [{ role:"system", content:SAMMY_SYSTEM }];
-  if (greet){
-    messages.push({ role:"user", content:"Caller just connected. Greet naturally in one short line and ask a simple opener."});
-  } else {
-    for (const m of s.history) messages.push(m);
-    messages.push({ role:"user", content:userText });
-  }
-  const payload = { model:"gpt-4o-mini", temperature:0.6, max_tokens:70, messages };
-
-  for (let i=0;i<2;i++){
-    try{
-      const r = await axios.post("https://api.openai.com/v1/chat/completions", payload, {
-        headers:{ Authorization:`Bearer ${OPENAI_API_KEY}` }
-      });
-      const out = (r.data.choices?.[0]?.message?.content || "").trim();
-      if (out) return out;
-    }catch(e){
-      console.error("OpenAI error:", e.response?.data || e.message);
-      await new Promise(r=>setTimeout(r, 300 + 300*i));
-    }
-  }
-  return "Quick one — could you say that again in a few words, mate?";
+// split reply into a fast first sentence + remainder (for low-latency)
+function splitForTurn(text) {
+  const parts = text.split(/(?<=[.!?])\s+/);
+  const first = parts.shift() || text;
+  const rest  = parts.join(" ");
+  return [first, rest];
 }
 
-// -------- ElevenLabs TTS
-async function tts(text){
-  try{
-    const resp = await axios.post(
-      `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`,
+// ====== OpenAI ======
+async function askOpenAI(history, userText) {
+  const messages = [
+    { role: "system", content: systemPersona() },
+    ...history.slice(-8),
+    { role: "user", content: userText }
+  ];
+
+  try {
+    const r = await axios.post(
+      "https://api.openai.com/v1/chat/completions",
       {
-        text,
-        model_id: "eleven_multilingual_v2",
-        voice_settings: {
-          stability: 0.22,          // slightly steadier, still lively
-          similarity_boost: 0.92,
-          style: 0.55,
-          use_speaker_boost: true
-        }
+        model: "gpt-4o-mini",
+        temperature: 0.8,
+        max_tokens: 160,
+        messages
       },
       {
-        headers:{
-          "xi-api-key": ELEVEN_API_KEY,
-          "Content-Type": "application/json",
-          Accept: "audio/mpeg"
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          "Content-Type": "application/json"
         },
-        responseType: "arraybuffer"
+        timeout: 20000
       }
     );
-    return Buffer.from(resp.data);
-  }catch(e){
-    console.error("ElevenLabs error:", e.response?.data || e.message);
+    const raw = r.data.choices?.[0]?.message?.content?.trim() || "Sorry, something went odd on my end.";
+    return sprinkleQuirks(raw);
+  } catch (err) {
+    console.error("OpenAI err:", err.response?.data || err.message);
+    return "Ah, sorry—little traffic jam on my end. Mind saying that again?";
+  }
+}
+
+// ====== ElevenLabs TTS ======
+async function makeTTS(text) {
+  // Keep TTS snappy by using expressive but stable-ish settings
+  const body = {
+    text,
+    model_id: "eleven_multilingual_v2",
+    voice_settings: {
+      stability: 0.15,
+      similarity_boost: 0.92,
+      style: SAMMY_MODE === "pro" ? 0.35 : 0.65,
+      use_speaker_boost: true
+    }
+  };
+
+  const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`;
+  try {
+    const r = await axios.post(url, body, {
+      headers: {
+        "xi-api-key": ELEVEN_API_KEY,
+        "Content-Type": "application/json",
+        Accept: "audio/mpeg"
+      },
+      responseType: "arraybuffer",
+      timeout: 25000
+    });
+    return Buffer.from(r.data);
+  } catch (err) {
+    console.error("ElevenLabs err:", err.response?.data || err.message);
     return null;
   }
 }
 
-// -------- tiny per-call audio cache
-const audio = new Map(); // sid -> Buffer
-app.get("/tts/:sid", (req, res) => {
-  const buf = audio.get(req.params.sid);
-  if(!buf) return res.status(404).send("No audio");
-  res.set("Content-Type","audio/mpeg");
+// ====== Session store ======
+const sessions = new Map(); // callSid -> { history: [...], last:Date }
+
+function getSession(callSid) {
+  let s = sessions.get(callSid);
+  if (!s) {
+    s = { history: [], last: Date.now() };
+    sessions.set(callSid, s);
+  }
+  s.last = Date.now();
+  return s;
+}
+
+// ====== Routes ======
+
+// landing + health
+app.get("/", (_req, res) => {
+  res.type("text/plain").send("✅ Sammy Voice Agent v3 is running. Twilio uses POST /voice");
+});
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, service: "sammy-voice-v3", time: new Date().toISOString() });
+});
+
+// serve mp3 from memory
+app.get("/a/:id", (req, res) => {
+  const buf = audioStore.get(req.params.id);
+  if (!buf) return res.status(404).send("Not found");
+  res.set("Content-Type", "audio/mpeg");
   res.send(buf);
 });
 
-// -------- Twilio webhook
+// Main entry from Twilio
 app.post("/voice", async (req, res) => {
-  const sid        = req.body.CallSid || "no_sid";
-  const speech     = (req.body.SpeechResult || req.body.TranscriptionText || "").trim();
-  const confidence = parseFloat(req.body.Confidence || "0");
-  const isNew      = !sessions.has(sid);
+  const callSid = req.body.CallSid || `local-${uuidv4()}`;
+  const base = baseUrl(req);
+  const s = getSession(callSid);
 
-  let bot;
-  if (isNew){
-    bot = await askOpenAI(sid, "", true);
-  } else {
-    if (!speech || (isFinite(confidence) && confidence < 0.45)){
-      const s = sess(sid);
-      s.emptyCount++;
-      bot = s.emptyCount === 1
-        ? "Sorry, that clipped on my end. One short line?"
-        : "Still choppy. Give me the short version, mate.";
-    } else {
-      pushUser(sid, speech);
-      bot = await askOpenAI(sid, speech, false);
-    }
-  }
+  const greet = GREETING_OVERRIDE ||
+    (SAMMY_MODE === "pro"
+      ? "G'day, Sammy here. How can I help you today?"
+      : "Heya, Sammy here. How can I help, mate?");
 
-  const spoken = humanize(bot);
-  pushBot(sid, spoken);
+  // Make a short greeting mp3 immediately for clean barge-in
+  const gAudio = await makeTTS(greet);
+  const id = uuidv4();
+  if (gAudio) audioStore.set(id, gAudio);
 
-  const mp3 = await tts(spoken);
-  audio.set(sid, mp3);
+  const hints = STT_HINTS ? `hints="${xmlEscape(STT_HINTS)}"` : "";
 
-  const url = baseUrl(req);
-  const ttsUrl = `${url}/tts/${encodeURIComponent(sid)}`;
-  const gatherUrl = `${url}/voice`;
-  const language = `language="en-AU"`;
-  const hintsAttr = STT_HINTS ? ` hints="${xmlEsc(STT_HINTS)}"` : "";
-
-  // *** FAST GATHER: short timeouts to avoid dead air ***
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Play>${xmlEsc(ttsUrl)}</Play>
-  <Gather input="speech" ${language} enhanced="true"${hintsAttr}
-          timeout="1" speechTimeout="0.6"
-          profanityFilter="false"
-          action="${xmlEsc(gatherUrl)}" method="POST" />
+  <Gather input="speech" enhanced="true" speechModel="${xmlEscape(TWILIO_SPEECH_MODEL)}"
+          language="en-AU" speechTimeout="auto" action="/gather" method="POST"
+          bargeIn="true" ${hints}>
+    <Play>${xmlEscape(base)}/a/${id}</Play>
+  </Gather>
+  <!-- If they say nothing, loop back once -->
+  <Redirect method="POST">/voice</Redirect>
 </Response>`;
+
   res.type("text/xml").send(twiml);
 });
 
-// -------- start
-app.listen(PORT, () => console.log(`Sammy v5 FAST listening on ${PORT}`));
+// After user speaks
+app.post("/gather", async (req, res) => {
+  const callSid = req.body.CallSid || `local-${uuidv4()}`;
+  const userText = (req.body.SpeechResult || "").trim();
+  const base = baseUrl(req);
+  const s = getSession(callSid);
+
+  if (!userText) {
+    const retry = await makeTTS("Sorry, I didn’t catch that—could you say it again, yeah?");
+    const rid = uuidv4(); if (retry) audioStore.set(rid, retry);
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Gather input="speech" enhanced="true" speechModel="${xmlEscape(TWILIO_SPEECH_MODEL)}"
+          language="en-AU" speechTimeout="auto" action="/gather" method="POST"
+          bargeIn="true">
+    <Play>${xmlEscape(base)}/a/${rid}</Play>
+  </Gather>
+  <Redirect method="POST">/voice</Redirect>
+</Response>`;
+    return res.type("text/xml").send(twiml);
+  }
+
+  // add to history
+  s.history.push({ role: "user", content: userText });
+
+  // get a lifelike short answer
+  const full = await askOpenAI(s.history, userText);
+  // split into first + remainder to reduce perceived latency
+  const [first, rest] = splitForTurn(full);
+
+  // first chunk TTS
+  const a1 = await makeTTS(first);
+  const id1 = uuidv4(); if (a1) audioStore.set(id1, a1);
+
+  // optionally prep second chunk (very short)
+  let secondUrl = "";
+  if (rest && rest.split(" ").length > 3) {
+    const a2 = await makeTTS(rest);
+    if (a2) {
+      const id2 = uuidv4();
+      audioStore.set(id2, a2);
+      secondUrl = `<Play>${xmlEscape(base)}/a/${id2}</Play>`;
+    }
+  }
+
+  // add assistant text to history (full)
+  s.history.push({ role: "assistant", content: full });
+
+  // keep convo moving; immediately listen again with barge-in
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Gather input="speech" enhanced="true" speechModel="${xmlEscape(TWILIO_SPEECH_MODEL)}"
+          language="en-AU" speechTimeout="auto" action="/gather" method="POST"
+          bargeIn="true">
+    <Play>${xmlEscape(base)}/a/${id1}</Play>
+    ${secondUrl}
+  </Gather>
+  <Redirect method="POST">/voice</Redirect>
+</Response>`;
+
+  res.type("text/xml").send(twiml);
+});
+
+// start
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  console.log("Sammy v3 listening on", PORT);
+});

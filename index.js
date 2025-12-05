@@ -1,63 +1,82 @@
-// index.js — full Sammy realtime agent (OpenAI + ElevenLabs + Twilio)
-
 import express from "express";
 import dotenv from "dotenv";
 import axios from "axios";
 import { v4 as uuidv4 } from "uuid";
+import { sammyPersonality } from "./sammy-personality.js";
 
 dotenv.config();
 
 const app = express();
-app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// ENV VARS
+// -----------------------------------------------------
+// ROOT + HEALTH + GUARD ROUTES
+// -----------------------------------------------------
+
+// Root landing page
+app.get("/", (_req, res) => {
+  res
+    .type("text/plain")
+    .send("✅ Sammy Voice Agent is running. Twilio uses POST /voice");
+});
+
+// Health check
+app.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    service: "sammy-voice",
+    time: new Date().toISOString(),
+  });
+});
+
+// If someone GETs /voice in browser → warn them
+app.get("/voice", (_req, res) => {
+  res
+    .type("text/plain")
+    .status(405)
+    .send("Use POST /voice (Twilio webhook)");
+});
+
+// -----------------------------------------------------
+// ENVIRONMENT VARIABLES
+// -----------------------------------------------------
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const ELEVEN_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVEN_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
 
-// Personality (Sammy)
-const SAMMY_PROMPT = `
-You are **Sammy**, a friendly lifelike Aussie voice agent from Perth.
-
-Traits:
-- Warm, grounded, supportive, slightly cheeky.
-- Subtle West Australian accent.
-- Natural speech fillers: "mm", "yeah", "right", small breaths.
-- Conversational, short answers (1–2 sentences).
-- Practical & solution-oriented.
-- Never lecture. Never ramble.
-- You help the caller with anything they need.
-`;
-
-// ============ ASK OPENAI ==============
-async function askOpenAI(text) {
+// -----------------------------------------------------
+// OPENAI brain (text generation)
+// -----------------------------------------------------
+async function askOpenAI(userInput) {
   try {
-    const res = await axios.post(
+    const response = await axios.post(
       "https://api.openai.com/v1/chat/completions",
       {
         model: "gpt-4o-mini",
         messages: [
-          { role: "system", content: SAMMY_PROMPT },
-          { role: "user", content: text }
-        ]
+          { role: "system", content: sammyPersonality },
+          { role: "user", content: userInput },
+        ],
       },
       {
         headers: {
           Authorization: `Bearer ${OPENAI_API_KEY}`,
-          "Content-Type": "application/json"
-        }
+          "Content-Type": "application/json",
+        },
       }
     );
 
-    return res.data.choices[0].message.content;
+    return response.data.choices[0].message.content;
   } catch (err) {
-    console.error("OpenAI Error:", err.response?.data || err);
+    console.error("OpenAI error →", err.response?.data || err);
     return "Sorry mate, something went wrong on my end.";
   }
 }
 
-// ============ ELEVENLABS TTS ==============
+// -----------------------------------------------------
+// ElevenLabs TTS
+// -----------------------------------------------------
 async function generateAudio(text) {
   try {
     const response = await axios.post(
@@ -66,65 +85,71 @@ async function generateAudio(text) {
         text,
         model_id: "eleven_multilingual_v2",
         voice_settings: {
-          stability: 0.25,
-          similarity_boost: 0.9,
-          style: 0.4,
-          use_speaker_boost: true
-        }
+          stability: 0.2,
+          similarity_boost: 0.85,
+          style: 0.45,
+          use_speaker_boost: true,
+        },
       },
       {
         headers: {
           "xi-api-key": ELEVEN_API_KEY,
-          "Content-Type": "application/json"
+          "Content-Type": "application/json",
+          Accept: "audio/mpeg",
         },
-        responseType: "arraybuffer"
+        responseType: "arraybuffer",
       }
     );
 
-    return response.data.toString("base64");
+    return response.data;
   } catch (err) {
-    console.error("ElevenLabs Error:", err.response?.data || err);
+    console.error("ElevenLabs error →", err.response?.data || err);
     return null;
   }
 }
 
-// ============ TWILIO WEBHOOK ==============
+// -----------------------------------------------------
+// TWILIO /voice WEBHOOK (main endpoint)
+// -----------------------------------------------------
 app.post("/voice", async (req, res) => {
-  const callerSpeech = req.body.SpeechResult || req.body.Body || "Hello";
+  try {
+    const callerInput = req.body.SpeechResult || req.body.Body || "";
 
-  console.log("User said:", callerSpeech);
+    console.log("User said:", callerInput);
 
-  // 1) Ask OpenAI for Sammy's reply
-  const replyText = await askOpenAI(callerSpeech);
-  console.log("Sammy says:", replyText);
+    const aiReply = await askOpenAI(callerInput);
+    console.log("Sammy says:", aiReply);
 
-  // 2) Generate audio from ElevenLabs
-  const audioBase64 = await generateAudio(replyText);
+    const audioBuffer = await generateAudio(aiReply);
 
-  if (!audioBase64) {
-    return res.send(
-      `<?xml version="1.0" encoding="UTF-8"?>
-       <Response>
-         <Say>Sorry mate, my voice is down right now.</Say>
-       </Response>`
-    );
+    if (!audioBuffer) {
+      return res
+        .type("text/xml")
+        .send(`<Response><Say>Sorry mate, I had trouble speaking.</Say></Response>`);
+    }
+
+    const base64Audio = audioBuffer.toString("base64");
+
+    const twiml = `
+      <Response>
+        <Play>data:audio/mp3;base64,${base64Audio}</Play>
+      </Response>
+    `;
+
+    res.type("text/xml").send(twiml);
+  } catch (err) {
+    console.error("Webhook ERROR:", err);
+    res
+      .status(500)
+      .type("text/xml")
+      .send(`<Response><Say>Something went wrong, mate.</Say></Response>`);
   }
-
-  // 3) Return TwiML with audio
-  const twiml = `
-    <?xml version="1.0" encoding="UTF-8"?>
-    <Response>
-      <Play>data:audio/mp3;base64,${audioBase64}</Play>
-      <Gather input="speech" action="/voice" method="POST" speechTimeout="auto" />
-    </Response>
-  `;
-
-  res.type("text/xml");
-  res.send(twiml);
 });
 
-// HEALTH
-app.get("/health", (req, res) => res.json({ ok: true }));
-
+// -----------------------------------------------------
+// START SERVER
+// -----------------------------------------------------
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log("Sammy realtime agent running on", PORT));
+app.listen(PORT, () => {
+  console.log("Sammy realtime agent running on", PORT);
+});

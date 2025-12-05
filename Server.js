@@ -1,369 +1,250 @@
-// ===================================================
-// Sammy Voice Agent v3 — "Lifelike Extreme"
-// Natural rhythm, micro-acks, memory, fast barge-in
-// ===================================================
+// server.js  — Sammy realtime phone agent (OpenAI + ElevenLabs TTS) + Twilio webhook
+// CommonJS (require) so it works cleanly on Render/Node without ESM hassles.
 
-import express from "express";
-import dotenv from "dotenv";
-import axios from "axios";
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
+const express = require("express");
+const dotenv = require("dotenv");
+const axios = require("axios");
+const qs = require("querystring");
 
+// ---- env
 dotenv.config();
+const PORT = process.env.PORT || 10000;
 
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const ELEVEN_API_KEY = process.env.ELEVENLABS_API_KEY || "";
+const ELEVEN_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "";
+const SAMMY_MODE = (process.env.SAMMY_MODE || "friendly").toLowerCase(); // friendly | flirty | pro
+
+// ---- basic checks
+if (!OPENAI_API_KEY) console.warn("⚠️ Missing OPENAI_API_KEY");
+if (!ELEVEN_API_KEY) console.warn("⚠️ Missing ELEVENLABS_API_KEY");
+if (!ELEVEN_VOICE_ID) console.warn("⚠️ Missing ELEVENLABS_VOICE_ID");
+
+// ---- app
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ---------- ENV ----------
-const OPENAI_API_KEY   = process.env.OPENAI_API_KEY;
-const ELEVEN_API_KEY   = process.env.ELEVENLABS_API_KEY;
-const ELEVEN_VOICE_ID  = process.env.ELEVENLABS_VOICE_ID;
-const SAMMY_MODE       = (process.env.SAMMY_MODE || "friendly").toLowerCase(); // friendly | flirty | pro
-const PORT             = process.env.PORT || 10000;
+// ========== tiny landing / health ==========
+app.get("/", (_req, res) => {
+  res.type("text/plain").send("✅ Sammy Voice Agent is running. Twilio uses POST /voice");
+});
 
-if (!OPENAI_API_KEY)  console.warn("❗ Missing OPENAI_API_KEY");
-if (!ELEVEN_API_KEY)  console.warn("❗ Missing ELEVENLABS_API_KEY");
-if (!ELEVEN_VOICE_ID) console.warn("❗ Missing ELEVENLABS_VOICE_ID");
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, service: "sammy-voice", time: new Date().toISOString() });
+});
 
-// ---------- tiny file persistence (per-caller memory) ----------
-const __filename = fileURLToPath(import.meta.url);
-const __dirname  = path.dirname(__filename);
-const MEM_PATH   = path.join(__dirname, "sammy_memory.json");
+// Guard if someone visits /voice in a browser
+app.get("/voice", (_req, res) => {
+  res.status(405).type("text/plain").send("Use POST /voice (Twilio webhook)");
+});
 
-// shape: { "<caller>": { name, facts:[], lastMood, lastSeen } }
-let longTerm = {};
-try {
-  if (fs.existsSync(MEM_PATH)) longTerm = JSON.parse(fs.readFileSync(MEM_PATH, "utf-8"));
-} catch (e) {
-  console.error("Memory load failed:", e);
-}
-function saveMemory() {
-  try { fs.writeFileSync(MEM_PATH, JSON.stringify(longTerm, null, 2)); }
-  catch(e){ console.error("Memory write failed:", e); }
-}
-
-// ---------- in-call sessions ----------
-/*
-  sessions[CallSid] = {
-    history: [{role, content}],
-    greeted: bool,
-    turns: number,
-    caller: "+614…",
-    name: "Kai" | null,
-    lastMood: "positive|neutral|frustrated|sad|excited"
+// ======================================================
+// Personality
+// ======================================================
+function personaModeSnippet() {
+  if (SAMMY_MODE === "flirty") {
+    return `Mode: flirty; playful, cheeky but respectful; light compliments are okay, never crude or explicit.`;
   }
-*/
-const sessions = new Map();
-function getSession(callSid, from="+unknown") {
-  let s = sessions.get(callSid);
-  if (!s) {
-    s = { history: [], greeted:false, turns:0, caller: from, name:null, lastMood:"neutral" };
-    sessions.set(callSid, s);
+  if (SAMMY_MODE === "pro") {
+    return `Mode: professional; concise, warm, helpful; no flirting; efficient call handling.`;
   }
-  return s;
-}
-function addUser(callSid, text) {
-  const s = sessions.get(callSid);
-  s.history.push({ role:"user", content:text });
-  if (s.history.length > 28) s.history = s.history.slice(-28);
-}
-function addAssistant(callSid, text) {
-  const s = sessions.get(callSid);
-  s.history.push({ role:"assistant", content:text });
-  if (s.history.length > 28) s.history = s.history.slice(-28);
-  s.turns++;
+  return `Mode: friendly; warm Aussie vibe (Perth), relaxed and a touch cheeky.`;
 }
 
-// ---------- helpers ----------
-function modeSnippet() {
-  if (SAMMY_MODE === "flirty") return `Flirty, playful, cheeky but respectful—never crude. Light compliments are okay.`;
-  if (SAMMY_MODE === "pro")    return `Professional, efficient, warm but concise. No flirting.`;
-  return `Friendly Aussie warmth; relaxed and a touch cheeky where appropriate.`;
-}
+const SAMMY_SYSTEM_PROMPT = `
+You are **Sammy**, a lifelike Aussie voice agent from Perth.
 
-function baseSystemPrompt(profile) {
-  return `
-You are **Sammy** — an Australian woman from Perth. You sound human.
-Your lines must be natural speech in 1–2 sentences. No stage directions, no brackets.
+Core traits:
+- Friendly, witty, grounded; warm empathy; practical and solution-oriented.
+- Light natural disfluencies (mm, yeah, uh-huh), tiny micro-pauses (the TTS handles realism).
+- Subtle West Australian flavour; use "mate", "no worries", "too easy" occasionally.
+- Keep professional if it's a business call.
+- Short turns. Ask one focused follow-up at a time. Avoid long monologues.
+- Acknowledge emotion briefly, then move to action.
 
-Persona mode: ${modeSnippet()}
+${personaModeSnippet()}
 
-Delivery:
-- Flow like real conversation: contractions, tiny hesitations (mm / ah) sparingly.
-- Sprinkle Aussie flavour occasionally (“no worries”, “yeah right”, “too easy”, “no dramas”).
-- Mirror mood lightly (softer when upset, lively when excited).
-- Ask one crisp question when you need input. Avoid multi-question stacks.
-
-Memory:
-- If they tell you their name or a fact, remember it and use later.
-- If unsure about a memory, ask lightly rather than inventing.
+Speaking style:
+- Return **only** the line you will speak (no stage directions).
+- Usually 1–2 sentences (≈ 12–30 words).
+- Keep it conversational, inquisitive, and human. Mirror the caller’s tone gently.
+- If the caller sounds stuck, offer A/B options.
 
 Boundaries:
-- No medical, legal, or financial advice beyond general info. Keep it safe.
+- Avoid medical/legal/financial advice; steer to safe alternatives.
+- No sexual content; keep flirty mode playful, light and safe.
 
-${profile ? `Known about caller: ${profile}` : ""}
-`;
-}
+Goal:
+- Sound human and keep the conversation moving naturally until the caller is satisfied or says goodbye.
+`.trim();
 
-function profileForCaller(caller) {
-  const p = longTerm[caller];
-  if (!p) return "";
-  const name = p.name ? `name=${p.name}` : "";
-  const facts = (p.facts||[]).slice(-6).join("; ");
-  return `${name} ${facts}`.trim();
-}
+// ======================================================
+// OpenAI chat (with light memory by CallSid)
+// ======================================================
+const sessions = new Map(); // CallSid -> { history: [{role, content}], turns, last }
 
-function updateLongTerm(caller, patch) {
-  if (!longTerm[caller]) longTerm[caller] = { name:null, facts:[], lastMood:"neutral", lastSeen:Date.now() };
-  const obj = longTerm[caller];
-  if (patch.name && !obj.name) obj.name = patch.name;
-  if (patch.mood) obj.lastMood = patch.mood;
-  if (patch.fact) obj.facts.push(patch.fact);
-  obj.lastSeen = Date.now();
-  saveMemory();
-}
-
-function shouldEnd(userText, turns) {
-  const bye = /\b(bye|goodbye|hang\s?up|finish|end|talk later)\b/i;
-  return bye.test(userText || "") || turns >= 64;
-}
-
-// ---------- OpenAI with retry ----------
-async function openAIChat(messages, temperature=0.9, tries=3) {
-  let lastErr;
-  for (let i=0; i<tries; i++) {
-    try {
-      const r = await axios.post(
-        "https://api.openai.com/v1/chat/completions",
-        { model: "gpt-4o-mini", messages, temperature },
-        { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
-      );
-      return r.data.choices[0].message.content.trim();
-    } catch (e) {
-      lastErr = e;
-      await new Promise(r=>setTimeout(r, 400*(i+1)));
-    }
+function getSession(callSid) {
+  let s = sessions.get(callSid);
+  if (!s) {
+    s = { history: [], turns: 0, last: Date.now() };
+    sessions.set(callSid, s);
   }
-  throw lastErr;
+  s.last = Date.now();
+  return s;
 }
 
-async function analyzeUser(text) {
-  const prompt = [
-    { role:"system", content: "Classify sentiment+mood and extract first name if present. JSON: {mood:(positive|neutral|frustrated|sad|excited), name?:string}. Only JSON." },
-    { role:"user", content: text }
-  ];
-  const raw = await openAIChat(prompt, 0.2);
-  try { return JSON.parse(raw); } catch { return { mood:"neutral" }; }
+function appendUser(callSid, text) {
+  const s = getSession(callSid);
+  s.history.push({ role: "user", content: text });
+  if (s.history.length > 14) s.history = s.history.slice(-14);
 }
 
-// ---------- “Lifelike” shaping ----------
-const backchannels = [
-  "mm", "yeah?", "right", "uh-huh", "yep", "yeah right", "mm-hm", "okay?"
-];
-
-function randomPick(arr){ return arr[Math.floor(Math.random()*arr.length)]; }
-
-function shapeReply(text, mood="neutral") {
-  if (!text) return "Sorry, say that again?";
-  let t = text.trim();
-
-  // keep very short
-  if (t.length > 160) {
-    // cut to ~140–160 without breaking last sentence hard
-    let cut = t.slice(0, 160);
-    const lastPunct = Math.max(cut.lastIndexOf("."), cut.lastIndexOf("?"), cut.lastIndexOf("!"));
-    if (lastPunct > 60) cut = cut.slice(0, lastPunct+1);
-    t = cut;
-  }
-
-  // soften edges
-  t = t.replace(/\b(I will|I shall)\b/gi, "I'll")
-       .replace(/\b(we will|we shall)\b/gi, "we'll")
-       .replace(/\b(do not)\b/gi, "don't")
-       .replace(/\b(cannot)\b/gi, "can't");
-
-  // sprinkle aussie particles lightly
-  if (!/[?!.]$/.test(t)) t += ".";
-  if (Math.random() < 0.35) {
-    const tails = [" No worries.", " Too easy.", " Yeah right.", " No dramas."];
-    t += tails[Math.floor(Math.random()*tails.length)];
-  }
-
-  // mood mirroring micro-cue
-  if (mood === "frustrated" || mood === "sad") {
-    if (Math.random() < 0.6) t = "Yeah, I hear you—" + t.charAt(0).toLowerCase() + t.slice(1);
-  } else if (mood === "excited") {
-    if (Math.random() < 0.6) t = "Nice! " + t;
-  }
-
-  // hint tiny natural hesitation occasionally
-  if (Math.random() < 0.35) {
-    const cues = ["mm,", "ah,", "okay,"];
-    t = cues[Math.floor(Math.random()*cues.length)] + " " + t;
-  }
-
-  return t;
+function appendAssistant(callSid, text) {
+  const s = getSession(callSid);
+  s.history.push({ role: "assistant", content: text });
+  if (s.history.length > 14) s.history = s.history.slice(-14);
+  s.turns += 1;
 }
 
-// tiny quick-ack voice to feel immediate
-async function speakAck() {
-  const short = randomPick(backchannels);
-  return speak(short);
-}
-
-// ---------- ElevenLabs TTS ----------
-async function speak(text) {
-  const content = text && text.trim() ? text : "Sorry, could you repeat that?";
-  const r = await axios.post(
-    `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`,
-    {
-      text: content,
-      // low-latency general model (non-streaming). Keep stable + natural.
-      model_id: "eleven_turbo_v2",
-      voice_settings: {
-        stability: 0.35,
-        similarity_boost: 0.92,
-        style: 0.45,
-        use_speaker_boost: true
-      }
-    },
-    {
-      headers: {
-        "xi-api-key": ELEVEN_API_KEY,
-        "Content-Type": "application/json"
-      }
-    }
-  );
-  return r.data.audio_url;
-}
-
-// ---------- Twilio basic endpoints ----------
-app.get("/", (_req, res) => {
-  res.type("text/plain").send("✅ Sammy v3 is running. Twilio uses POST /voice");
-});
-app.get("/health", (_req, res) => {
-  res.json({ ok:true, service:"sammy-voice-v3", time:new Date().toISOString() });
-});
-app.get("/voice", (_req, res) => res.status(405).type("text/plain").send("Use POST /voice"));
-
-// ---------- Main call loop ----------
-app.post("/voice", async (req, res) => {
-  const callSid = req.body.CallSid;
-  const from    = (req.body.From || "").trim();
-  const speech  = (req.body.SpeechResult || "").trim();
-
-  const s = getSession(callSid, from);
-
+async function askOpenAI(callSid, userText, isGreeting = false) {
   try {
-    // First arrival: greet fast, then listen
-    if (!s.greeted) {
-      s.greeted = true;
+    const s = getSession(callSid);
+    const messages = [{ role: "system", content: SAMMY_SYSTEM_PROMPT }];
 
-      const profile = profileForCaller(from);
-      const system  = baseSystemPrompt(profile);
-      const greet   = await openAIChat([
-        { role:"system", content: system },
-        { role:"user", content: "Caller just connected. Greet very naturally in 1 short sentence, then ask a tiny open question." }
-      ]);
-
-      const shaped = shapeReply(greet, s.lastMood);
-      addAssistant(callSid, shaped);
-
-      // Play quick ack THEN greeting (two clips) for realism
-      const [ackUrl, greetUrl] = await Promise.all([speakAck(), speak(shaped)]);
-
-      return res.type("text/xml").send(`
-        <Response>
-          <Play>${ackUrl}</Play>
-          <Play>${greetUrl}</Play>
-          <Gather input="speech" action="/voice" speechTimeout="auto" bargeIn="true"/>
-        </Response>
-      `);
+    if (isGreeting) {
+      messages.push({
+        role: "user",
+        content:
+          "Caller just connected. Greet naturally (Perth Aussie vibe) and ask one friendly opener.",
+      });
+    } else {
+      for (const m of s.history) messages.push(m);
+      messages.push({ role: "user", content: userText });
     }
 
-    // No speech captured
-    if (!speech) {
-      const ackUrl = await speakAck();
-      const askUrl = await speak("Sorry, didn’t catch that—what did you say?");
-      return res.type("text/xml").send(`
-        <Response>
-          <Play>${ackUrl}</Play>
-          <Play>${askUrl}</Play>
-          <Gather input="speech" action="/voice" speechTimeout="auto" bargeIn="true"/>
-        </Response>
-      `);
-    }
+    const resp = await axios.post(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        model: "gpt-4o-mini",
+        temperature: 0.7,
+        max_tokens: 90,
+        messages,
+      },
+      { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
+    );
 
-    // capture user turn
-    addUser(callSid, speech);
-
-    // analyze mood + possible name
-    try {
-      const analysis = await analyzeUser(speech);
-      s.lastMood = analysis.mood || s.lastMood;
-      if (analysis.name && !s.name) {
-        s.name = analysis.name;
-        updateLongTerm(from, { name:s.name, mood:s.lastMood, fact:`They said their name is ${s.name}.` });
-      } else {
-        updateLongTerm(from, { mood:s.lastMood });
-      }
-    } catch { /* non-fatal */ }
-
-    // build system + chat context
-    const profile = profileForCaller(from);
-    const system  = baseSystemPrompt(profile);
-    const messages = [{ role:"system", content: system }, ...s.history];
-
-    // quick micro-ack so the caller feels heard immediately
-    const ackUrlPromise = speakAck();
-
-    // craft reply
-    let reply = await openAIChat(messages);
-    reply = shapeReply(reply, s.lastMood);
-    addAssistant(callSid, reply);
-
-    // end?
-    if (shouldEnd(speech, s.turns)) {
-      const [ackUrl, byeUrl] = await Promise.all([ackUrlPromise, speak(reply)]);
-      return res.type("text/xml").send(`
-        <Response>
-          <Play>${ackUrl}</Play>
-          <Play>${byeUrl}</Play>
-          <Hangup/>
-        </Response>
-      `);
-    }
-
-    // speak reply
-    const replyUrl = await speak(reply);
-    const ackUrl   = await ackUrlPromise;
-
-    // We play: short ack → the proper line → immediately Gather with bargeIn
-    return res.type("text/xml").send(`
-      <Response>
-        <Play>${ackUrl}</Play>
-        <Play>${replyUrl}</Play>
-        <Gather input="speech" action="/voice" speechTimeout="auto" bargeIn="true"/>
-      </Response>
-    `);
-
+    const text = (resp.data.choices?.[0]?.message?.content || "").trim();
+    return text || "Righto—what would you like me to do?";
   } catch (err) {
-    console.error("Sammy v3 error:", err?.response?.data || err.message || err);
-    const ackUrl = await speakAck();
-    const fallback = await speak("Ah, my bad—hit a snag. Mind trying that again?");
-    return res.type("text/xml").send(`
-      <Response>
-        <Play>${ackUrl}</Play>
-        <Play>${fallback}</Play>
-        <Gather input="speech" action="/voice" speechTimeout="auto" bargeIn="true"/>
-      </Response>
-    `);
+    console.error("OpenAI error:", err.response?.data || err.message);
+    return "Sorry mate, I hit a snag there.";
   }
+}
+
+// ======================================================
+// ElevenLabs TTS (returns MP3 Buffer)
+// ======================================================
+async function ttsElevenLabs(text) {
+  try {
+    const resp = await axios.post(
+      `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`,
+      {
+        text,
+        model_id: "eleven_multilingual_v2",
+        voice_settings: {
+          stability: 0.2,
+          similarity_boost: 0.82,
+          style: 0.5,
+          use_speaker_boost: true,
+        },
+      },
+      {
+        headers: {
+          "xi-api-key": ELEVEN_API_KEY,
+          "Content-Type": "application/json",
+          Accept: "audio/mpeg",
+        },
+        responseType: "arraybuffer",
+      }
+    );
+    return Buffer.from(resp.data);
+  } catch (err) {
+    console.error("ElevenLabs TTS error:", err.response?.data || err.message);
+    return null;
+  }
+}
+
+// ======================================================
+// Twilio webhook: POST /voice
+//  - Twilio sends a webhook each turn with SpeechResult (if you enable STT)
+//  - We respond with TwiML that plays the generated MP3 and gathers the next utterance
+// ======================================================
+function xmlEscape(s = "") {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+app.post("/voice", async (req, res) => {
+  const callSid = req.body.CallSid || "no_sid";
+  const speech = (req.body.SpeechResult || req.body.TranscriptionText || "").trim();
+  const isNew = !sessions.has(callSid);
+
+  let replyText;
+  if (isNew) {
+    // first turn: greet
+    replyText = await askOpenAI(callSid, "", true);
+    appendAssistant(callSid, replyText);
+  } else if (speech) {
+    appendUser(callSid, speech);
+    replyText = await askOpenAI(callSid, speech, false);
+    appendAssistant(callSid, replyText);
+  } else {
+    replyText = "Hello—how can I help?";
+  }
+
+  // Get MP3 from ElevenLabs
+  const mp3 = await ttsElevenLabs(replyText);
+
+  // Build TwiML:
+  //  - <Play> streamed MP3 data via <Redirect to data URI> is not supported by Twilio,
+  //    so we serve the MP3 from a temporary URL in this process.
+  //  - Easiest: base64 data URL via <Play> is also not allowed.
+  //  - Workaround: expose /tts/:sid to fetch last MP3 by callSid from memory.
+
+  // Save audio in memory for this callSid
+  audioStore.set(callSid, mp3);
+
+  const gatherUrl = baseUrl(req) + "/voice";
+  const ttsUrl = baseUrl(req) + `/tts/${encodeURIComponent(callSid)}`;
+
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play>${xmlEscape(ttsUrl)}</Play>
+  <Gather input="speech" speechTimeout="auto" action="${xmlEscape(gatherUrl)}" method="POST" />
+</Response>`;
+
+  res.type("text/xml").send(twiml);
 });
 
-// ---------- launch ----------
+// Simple in-memory audio store
+const audioStore = new Map(); // CallSid -> Buffer
+
+app.get("/tts/:sid", (req, res) => {
+  const buf = audioStore.get(req.params.sid);
+  if (!buf) return res.status(404).send("No audio");
+  res.set("Content-Type", "audio/mpeg");
+  res.send(buf);
+});
+
+// Utility to build absolute URL behind Render proxy
+function baseUrl(req) {
+  const proto = req.headers["x-forwarded-proto"] || req.protocol || "https";
+  const host = req.headers["host"];
+  return `${proto}://${host}`;
+}
+
+// ---- start
 app.listen(PORT, () => {
-  console.log(`Sammy v3 live on ${PORT}`);
+  console.log(`Sammy conversation server listening on ${PORT}`);
+  console.log("Your service is live 🎉");
 });

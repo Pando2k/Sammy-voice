@@ -1,8 +1,7 @@
-
 {
   "name": "sammy-voice",
   "version": "1.0.0",
-  "description": "voice webhook server for Sammy using Twilio + Render",
+  "description": "Voice webhook server for Sammy using Twilio + Render",
   "type": "module",
   "main": "index.js",
   "scripts": {

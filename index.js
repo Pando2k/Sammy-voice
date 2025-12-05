@@ -1,12 +1,16 @@
 import express from "express";
-import { twiml } from "twilio";
+import twilio from "twilio";
 
 const app = express();
+const { twiml } = twilio;
+
+// Twilio sends form-encoded data, so we enable URL encoding
 app.use(express.urlencoded({ extended: false }));
 
-// --- Sammy Voice Endpoint ---
+// --- Voice endpoint for Twilio ---
 app.post("/voice", (req, res) => {
   const response = new twiml.VoiceResponse();
+
   response.say(
     {
       voice: "Polly.Nicole-Neural" // Australian female neural voice
@@ -18,11 +22,13 @@ app.post("/voice", (req, res) => {
   res.send(response.toString());
 });
 
-// Default homepage
+// Default homepage (useful for testing)
 app.get("/", (req, res) => {
   res.send("Sammy Voice Server is running!");
 });
 
-// Render port
+// Render uses process.env.PORT
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Server running on port ${port}`));
+app.listen(port, () => {
+  console.log(`Server running on port ${port}`);
+});

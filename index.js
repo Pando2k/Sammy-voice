@@ -17,11 +17,13 @@ const ELEVEN_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
 // ===== In-memory audio store =====
 const audioStore = new Map(); // id -> Buffer (mp3)
 
-// ===== Helper: base URL =====
+// ===== Helpers =====
 function baseUrl(req) {
   const proto = req.headers["x-forwarded-proto"] || req.protocol || "https";
   return `${proto}://${req.get("host")}`;
 }
+const xmlEscape = (s = "") =>
+  s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
 // ===== OpenAI (chat) =====
 async function askOpenAI(userInput) {
@@ -35,7 +37,7 @@ async function askOpenAI(userInput) {
           { role: "user", content: userInput || "Say a short friendly greeting." }
         ],
         temperature: 0.6,
-        max_tokens: 120
+        max_tokens: 140
       },
       {
         headers: {
@@ -54,6 +56,7 @@ async function askOpenAI(userInput) {
 
 // ===== ElevenLabs (TTS) -> mp3 Buffer =====
 async function ttsElevenLabs(text) {
+  if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) return null;
   try {
     const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`;
     const resp = await axios.post(
@@ -71,7 +74,7 @@ async function ttsElevenLabs(text) {
       {
         headers: {
           "xi-api-key": ELEVEN_API_KEY,
-          "Accept": "audio/mpeg",
+          Accept: "audio/mpeg",
           "Content-Type": "application/json"
         },
         responseType: "arraybuffer",
@@ -89,11 +92,9 @@ async function ttsElevenLabs(text) {
 app.get("/", (_req, res) => {
   res.type("text/plain").send("✅ Sammy Voice Agent is running. Twilio uses POST /voice");
 });
-
 app.get("/health", (_req, res) => {
   res.json({ ok: true, service: "sammy-voice", time: new Date().toISOString() });
 });
-
 app.get("/voice", (_req, res) => {
   res.type("text/plain").status(405).send("Use POST /voice (Twilio webhook)");
 });
@@ -107,43 +108,67 @@ app.get("/audio/:id", (req, res) => {
   res.send(buf);
 });
 
+// ===== Build TwiML that PROMPTS + GATHERS =====
+function twimlGatherPlayOrSay(req, text, opts = {}) {
+  const {
+    playUrl,                 // if provided, <Play> this
+    action = "/voice",       // where Twilio POSTs speech
+    method = "POST",
+    language = "en-AU",
+    input = "speech",
+    speechTimeout = "auto",
+    profanityFilter = "false",
+    hints = ""               // speech hints (comma-delimited)
+  } = opts;
+
+  const safeSay = xmlEscape(text);
+
+  // <Gather> can nest <Play> or <Say> as a prompt
+  const prompt = playUrl
+    ? `<Play>${playUrl}</Play>`
+    : `<Say language="${language}" voice="Polly.Nicole-Neural">${safeSay}</Say>`;
+
+  // After Gather, redirect back to /voice to keep the line open if silence
+  const twiml =
+    `<?xml version="1.0" encoding="UTF-8"?>` +
+    `<Response>` +
+      `<Gather input="${input}" language="${language}" action="${action}" method="${method}" speechTimeout="${speechTimeout}" profanityFilter="${profanityFilter}" hints="${xmlEscape(hints)}">` +
+        prompt +
+      `</Gather>` +
+      `<Redirect method="POST">${action}</Redirect>` +
+    `</Response>`;
+
+  return twiml;
+}
+
 // ===== Twilio webhook (POST /voice) =====
 app.post("/voice", async (req, res) => {
-  // Pull something reasonable from Twilio payload
-  const userInput =
-    req.body.SpeechResult ||
-    req.body.TranscriptionText ||
-    req.body.Digits ||
-    req.body.Body ||
-    "Hello";
+  // If Twilio sends speech, it will be here:
+  const speech = (req.body.SpeechResult || req.body.TranscriptionText || "").trim();
+  const hasSpeech = Boolean(speech);
+
+  // First turn: greet briefly if there’s no speech yet
+  const userInput = hasSpeech ? speech : "Greet the caller briefly and ask how you can help.";
 
   // Get Sammy's reply
   const reply = await askOpenAI(userInput);
 
-  // If ElevenLabs env is present, synthesize and <Play/> audio. Otherwise fall back to <Say/>.
-  if (ELEVEN_API_KEY && ELEVEN_VOICE_ID) {
-    const mp3 = await ttsElevenLabs(reply);
-    if (mp3) {
-      const id = uuidv4();
-      audioStore.set(id, mp3);
-      // Auto-clean after 10 minutes to keep memory tidy
-      setTimeout(() => audioStore.delete(id), 10 * 60 * 1000);
-
-      const url = `${baseUrl(req)}/audio/${id}`;
-      const twiml =
-        `<?xml version="1.0" encoding="UTF-8"?>` +
-        `<Response><Play>${url}</Play></Response>`;
-
-      res.set("Content-Type", "text/xml");
-      return res.send(twiml);
-    }
+  // Try TTS (preferred)
+  let playUrl = null;
+  const mp3 = await ttsElevenLabs(reply);
+  if (mp3) {
+    const id = uuidv4();
+    audioStore.set(id, mp3);
+    setTimeout(() => audioStore.delete(id), 10 * 60 * 1000);
+    playUrl = `${baseUrl(req)}/audio/${id}`;
   }
 
-  // Fallback: simple <Say/> if TTS unavailable
-  const safe = reply.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  const twiml =
-    `<?xml version="1.0" encoding="UTF-8"?>` +
-    `<Response><Say>${safe}</Say></Response>`;
+  // Build Gather TwiML
+  const twiml = twimlGatherPlayOrSay(req, reply, {
+    playUrl,
+    hints: "yes,no,okay,right,book,booking,order,account,email,address,Perth,Australia"
+  });
+
   res.set("Content-Type", "text/xml");
   res.send(twiml);
 });
@@ -151,5 +176,5 @@ app.post("/voice", async (req, res) => {
 // ===== Start server =====
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`Sammy voice server listening on ${PORT}`);
+  console.log(`Sammy conversation server listening on ${PORT}`);
 });

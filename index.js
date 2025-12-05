@@ -10,18 +10,18 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ===== ENV =====
-const OPENAI_API_KEY   = process.env.OPENAI_API_KEY;
-const ELEVEN_API_KEY   = process.env.ELEVENLABS_API_KEY;
-const ELEVEN_VOICE_ID  = process.env.ELEVENLABS_VOICE_ID;
+// ================= ENV =================
+const OPENAI_API_KEY  = process.env.OPENAI_API_KEY;
+const ELEVEN_API_KEY  = process.env.ELEVENLABS_API_KEY;
+const ELEVEN_VOICE_ID = process.env.ELEVENLABS_VOICE_ID;
 
 if (!OPENAI_API_KEY)  console.warn("⚠️ Missing OPENAI_API_KEY");
 if (!ELEVEN_API_KEY)  console.warn("⚠️ Missing ELEVENLABS_API_KEY");
 if (!ELEVEN_VOICE_ID) console.warn("⚠️ Missing ELEVENLABS_VOICE_ID");
 
-// ===== SIMPLE IN-MEMORY STORES =====
-const audioStore = new Map();                 // id -> Buffer (mp3)
-const sessions  = new Map();                  // CallSid -> {history, greeted, turns, last}
+// ============ In-memory stores ============
+const audioStore = new Map(); // id -> Buffer (mp3)
+const sessions  = new Map(); // CallSid -> { history, greeted, turns, last }
 
 // Session helpers
 function getSession(callSid) {
@@ -36,7 +36,7 @@ function getSession(callSid) {
 function appendUser(callSid, text) {
   const s = getSession(callSid);
   s.history.push({ role: "user", content: text });
-  if (s.history.length > 12) s.history = s.history.slice(-12); // keep last 12 exchanges
+  if (s.history.length > 12) s.history = s.history.slice(-12);
 }
 function appendAssistant(callSid, text) {
   const s = getSession(callSid);
@@ -46,34 +46,32 @@ function appendAssistant(callSid, text) {
 }
 function shouldEnd(callSid, lastUserText, turns) {
   const byeRegex = /\b(bye|goodbye|hang ?up|that'?s all|finish|stop|end)\b/i;
-  return byeRegex.test(lastUserText || "") || turns >= 20;
+  return byeRegex.test(lastUserText || "") || turns >= 30; // allow longer chats
 }
 
-// ===== UTILS =====
+// ================ Utils =================
 function baseUrl(req) {
   const proto = req.headers["x-forwarded-proto"] || req.protocol || "https";
   return `${proto}://${req.get("host")}`;
 }
-const xmlEscape = s => (s || "")
-  .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const xmlEscape = (s = "") =>
+  s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
-// ===== OPENAI =====
+// ================ OpenAI =================
 async function askOpenAI(callSid, userText, isGreeting = false) {
   try {
-    const sys = sammyPersonality + `
-Rules for multi-turn:
-- Keep it conversational and short (1–2 sentences).
-- Ask a simple follow-up when helpful.
-- Use Aussie warmth.
-- Avoid over-apologising.`;
+    const sys = `${sammyPersonality}
+Multi-turn rules:
+- Be concise and natural (1–2 sentences).
+- Add a gentle follow-up question when helpful.
+- Avoid over-apologising or sounding robotic.`;
 
     const s = getSession(callSid);
     const messages = [{ role: "system", content: sys }];
 
-    // Add prior turns
+    // prior history
     for (const m of s.history) messages.push(m);
 
-    // If greeting: steer opening
     if (isGreeting) {
       messages.push({
         role: "user",
@@ -88,7 +86,7 @@ Rules for multi-turn:
       {
         model: "gpt-4o-mini",
         messages,
-        temperature: 0.65,
+        temperature: 0.65,     // ↑ more chatty, ↓ more concise
         max_tokens: 220,
         presence_penalty: 0.2,
         frequency_penalty: 0.2
@@ -103,11 +101,11 @@ Rules for multi-turn:
     return text || "Righto. How can I help?";
   } catch (err) {
     console.error("OpenAI error:", err.response?.data || err.message);
-    return "Sorry mate, my brain glitched for a sec. What did you say?";
+    return "Sorry mate, my brain glitched for a sec — what did you say?";
   }
 }
 
-// ===== ELEVENLABS TTS =====
+// =============== ElevenLabs TTS ===============
 async function ttsElevenLabs(text) {
   if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) return null;
   try {
@@ -118,9 +116,9 @@ async function ttsElevenLabs(text) {
         text,
         model_id: "eleven_multilingual_v2",
         voice_settings: {
-          stability: 0.25,
-          similarity_boost: 0.9,
-          style: 0.5,
+          stability: 0.2,          // lower = more expressive
+          similarity_boost: 0.9,   // higher = closer to the voice
+          style: 0.55,
           use_speaker_boost: true
         }
       },
@@ -141,7 +139,7 @@ async function ttsElevenLabs(text) {
   }
 }
 
-// ===== HEALTH / LANDING / GUARD =====
+// ============ Small GET routes ============
 app.get("/", (_req, res) => {
   res.type("text/plain").send("✅ Sammy Voice Agent is running. Twilio uses POST /voice");
 });
@@ -152,7 +150,7 @@ app.get("/voice", (_req, res) => {
   res.type("text/plain").status(405).send("Use POST /voice (Twilio webhook)");
 });
 
-// Serve audio
+// Serve audio for Twilio <Play>
 app.get("/audio/:id", (req, res) => {
   const buf = audioStore.get(req.params.id);
   if (!buf) return res.status(404).type("text/plain").send("Audio not found");
@@ -161,22 +159,17 @@ app.get("/audio/:id", (req, res) => {
   res.send(buf);
 });
 
-// ===== TwiML builders =====
+// ============ TwiML builders ============
 function twimlGather({ promptSay, promptPlayUrl, action = "/voice" }) {
-  // We use actionOnEmptyResult so even if silence, we loop back into /voice
   const say = promptPlayUrl
     ? `<Play>${promptPlayUrl}</Play>`
     : `<Say language="en-AU" voice="Polly.Nicole-Neural">${xmlEscape(promptSay)}</Say>`;
 
+  // actionOnEmptyResult keeps the loop if caller is silent
   const twiml =
     `<?xml version="1.0" encoding="UTF-8"?>` +
     `<Response>` +
-      `<Gather input="speech"` +
-              ` language="en-AU"` +
-              ` action="${action}" method="POST"` +
-              ` speechTimeout="auto"` +
-              ` actionOnEmptyResult="true"` +
-              ` hints="${xmlEscape('yes,no,okay,booking,order,account,email,address,Perth,Australia')}">` +
+      `<Gather input="speech" language="en-AU" action="${action}" method="POST" speechTimeout="auto" actionOnEmptyResult="true" hints="${xmlEscape('yes,no,okay,booking,order,account,email,address,Perth,Australia')}">` +
         `${say}` +
       `</Gather>` +
       `<Redirect method="POST">${action}</Redirect>` +
@@ -184,7 +177,7 @@ function twimlGather({ promptSay, promptPlayUrl, action = "/voice" }) {
   return twiml;
 }
 
-function twimlGoodbye(text = "Cheers then — talk soon!") {
+function twimlGoodbye(text = "No worries — I’ll let you go. Have a good one!") {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say language="en-AU" voice="Polly.Nicole-Neural">${xmlEscape(text)}</Say>
@@ -192,7 +185,7 @@ function twimlGoodbye(text = "Cheers then — talk soon!") {
 </Response>`;
 }
 
-// ===== MAIN TWILIO WEBHOOK =====
+// ============ Main Twilio webhook ============
 app.post("/voice", async (req, res) => {
   const callSid = req.body.CallSid || "unknown";
   const speech  = (req.body.SpeechResult || req.body.TranscriptionText || "").trim();
@@ -200,13 +193,13 @@ app.post("/voice", async (req, res) => {
 
   const s = getSession(callSid);
 
-  // Greeting turn
+  // First turn: greet once
   if (!s.greeted) {
     s.greeted = true;
     const reply = await askOpenAI(callSid, "", true);
     appendAssistant(callSid, reply);
 
-    // TTS
+    // TTS preferred
     let playUrl = null;
     const mp3 = await ttsElevenLabs(reply);
     if (mp3) {
@@ -221,22 +214,20 @@ app.post("/voice", async (req, res) => {
     return;
   }
 
-  // Conversational turn
+  // Conversation turns
   const userText = hasSpeech ? speech : "";
   if (hasSpeech) appendUser(callSid, userText);
 
-  // End conditions
   if (shouldEnd(callSid, userText, s.turns)) {
-    const bye = "No worries — I’ll let you go. Have a good one!";
+    const bye = "Too easy — I’ll let you go. Thanks for the chat!";
     res.type("text/xml").send(twimlGoodbye(bye));
     sessions.delete(callSid);
     return;
   }
 
-  // If no speech came through, reprompt softly
-  const repromptIfSilent = !hasSpeech;
+  // If silent → reprompt softly
+  const reprompt = !hasSpeech;
 
-  // Ask LLM with history
   const reply = await askOpenAI(callSid, userText, false);
   appendAssistant(callSid, reply);
 
@@ -250,7 +241,7 @@ app.post("/voice", async (req, res) => {
     playUrl = `${baseUrl(req)}/audio/${id}`;
   }
 
-  const prompt = repromptIfSilent
+  const prompt = reprompt
     ? "Sorry, I didn’t catch that — could you say that again?"
     : reply;
 
@@ -258,16 +249,16 @@ app.post("/voice", async (req, res) => {
   res.type("text/xml").send(twiml);
 });
 
-// ===== START =====
+// ============ Start server ============
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`Sammy conversation server listening on ${PORT}`);
 });
 
-// ===== OPTIONAL CLEANUP: expire old sessions (memory) =====
+// ============ Cleanup old sessions ============
 setInterval(() => {
   const now = Date.now();
   for (const [sid, s] of sessions.entries()) {
-    if (now - s.last > 30 * 60 * 1000) sessions.delete(sid); // 30 min idle
+    if (now - s.last > 30 * 60 * 1000) sessions.delete(sid);
   }
 }, 5 * 60 * 1000);

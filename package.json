@@ -1,7 +1,7 @@
 {
-  "name": "sammy-v4-ultra-interactive",
+  "name": "sammy-v4.1-fast-snappy",
   "version": "1.0.0",
-  "description": "Sammy v4 Ultra-Interactive (Playful + Cheeky) — Twilio + OpenAI + ElevenLabs",
+  "description": "Sammy v4.1 Fast & Snappy — Twilio + OpenAI + ElevenLabs",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
